@@ -14,16 +14,18 @@ use fln_olean::ir::{IrAlt, IrArg, IrDecl, IrExpr, IrModule, IrParam, IrStmt, IrT
 use std::collections::BTreeMap;
 
 mod array_proofs;
+mod base_io_tasks;
 mod boxed;
 mod primitives;
 mod string_proofs;
+mod tasks;
 
 pub(super) use boxed::{BoxedNative, boxed_row};
 
 #[derive(Clone, Copy)]
 struct ErasedOperands {
     runtime: usize,
-    type_prefix: bool,
+    type_prefix: usize,
     proof_suffix: usize,
 }
 
@@ -51,8 +53,22 @@ pub(super) fn erase_type_arguments(
         let bridge = if let Some(runtime) = erased_type_runtime_arity(row)? {
             Some(ErasedOperands {
                 runtime,
-                type_prefix: true,
+                type_prefix: 1,
                 proof_suffix: 0,
+            })
+        } else if let Some(signature) = tasks::signature(row)? {
+            Some(ErasedOperands {
+                runtime: signature.parameters.len(),
+                type_prefix: signature.erased_prefix,
+                proof_suffix: 0,
+            })
+        } else if let Some(signature) = base_io_tasks::signature(row)? {
+            Some(ErasedOperands {
+                runtime: signature.parameters.len(),
+                type_prefix: signature.erased_prefix,
+                // The final world is independently inert; waitAny also
+                // retains its nonempty-list proof immediately before it.
+                proof_suffix: signature.erased_proofs + 1,
             })
         } else {
             array_proofs::erased_operands(row)?
@@ -60,7 +76,10 @@ pub(super) fn erase_type_arguments(
                 .or(natural_division_operands(row)?)
         };
         if let Some(bridge) = bridge {
-            bridges.insert(name.clone(), bridge);
+            bridges.insert(
+                name.clone(),
+                (bridge, native.reference_base_io_task_telescope),
+            );
         }
     }
     if bridges.is_empty() {
@@ -89,15 +108,23 @@ pub(super) fn erase_type_arguments(
                         expr: IrExpr::Fap { function, args },
                         ..
                     } => {
-                        let Some(&bridge) = bridges.get(function) else {
+                        let Some(&(bridge, reference_telescope)) = bridges.get(function) else {
                             continue;
                         };
                         if args.len() == bridge.runtime {
+                            if reference_telescope {
+                                return Err(unsupported(
+                                    name,
+                                    "native BaseIO task call omits explicit erased telescope",
+                                ));
+                            }
                             continue;
                         }
-                        let erased = usize::from(bridge.type_prefix) + bridge.proof_suffix;
+                        let erased = bridge.type_prefix + bridge.proof_suffix;
                         if args.len() != bridge.runtime + erased
-                            || (bridge.type_prefix && args.first() != Some(&IrArg::Erased))
+                            || args[..bridge.type_prefix]
+                                .iter()
+                                .any(|argument| argument != &IrArg::Erased)
                             || args[args.len() - bridge.proof_suffix..]
                                 .iter()
                                 .any(|argument| argument != &IrArg::Erased)
@@ -105,18 +132,20 @@ pub(super) fn erase_type_arguments(
                             return Err(unsupported(name, "unreviewed native erased operand"));
                         }
                         args.truncate(args.len() - bridge.proof_suffix);
-                        if bridge.type_prefix {
-                            args.remove(0);
-                        }
+                        args.drain(..bridge.type_prefix).for_each(drop);
                     }
                     IrStmt::VDecl {
                         expr: IrExpr::Pap { function, args },
                         ..
-                    } if bridges.get(function).is_some_and(|bridge| {
-                        (bridge.type_prefix && args.first() == Some(&IrArg::Erased))
-                            || (bridge.proof_suffix != 0
-                                && (args.len() > bridge.runtime || args.contains(&IrArg::Erased)))
-                    }) =>
+                    } if bridges
+                        .get(function)
+                        .is_some_and(|(bridge, reference_telescope)| {
+                            *reference_telescope
+                                || (bridge.type_prefix != 0 && args.first() == Some(&IrArg::Erased))
+                                || (bridge.proof_suffix != 0
+                                    && (args.len() > bridge.runtime
+                                        || args.contains(&IrArg::Erased)))
+                        }) =>
                     {
                         return Err(unsupported(name, "first-class erased native primitive"));
                     }
@@ -133,6 +162,15 @@ pub(super) fn erase_type_arguments(
         }
     }
     Ok(())
+}
+
+pub(super) fn base_io_task_reference_telescope(
+    row: &GeneratedExternRow,
+    arity: usize,
+) -> Result<bool, IrExecutionError> {
+    Ok(base_io_tasks::signature(row)?.is_some_and(|signature| {
+        arity == signature.erased_prefix + signature.parameters.len() + signature.erased_proofs + 1
+    }))
 }
 
 /// Nat.divExact retains its divisibility proof in the pin's IR telescope,
@@ -168,7 +206,7 @@ fn natural_division_operands(
     }
     Ok(Some(ErasedOperands {
         runtime: 2,
-        type_prefix: false,
+        type_prefix: 0,
         proof_suffix: 1,
     }))
 }
@@ -486,6 +524,8 @@ pub(super) fn validate_extern_signature(
     {
         return primitive.validate_extern(row, params, result);
     }
+    tasks::validate_native_signature(row, params, result)?;
+    base_io_tasks::validate_native_signature(row, params, result)?;
     if row.id == "extern:Void.mk" && params.len() == 2 {
         erased_type_runtime_arity(row)?;
         if params[0].ty != IrType::Erased
@@ -587,6 +627,11 @@ fn reviewed_rule_arity(
     row: &GeneratedExternRow,
     ownership: &Ownership,
 ) -> Result<usize, extern_row::ContractError> {
+    if let Some(signature) = base_io_tasks::signature(row)
+        .map_err(|error| extern_row::ContractError::new(error.to_string()))?
+    {
+        return Ok(signature.parameters.len());
+    }
     if row.id != "extern:ST.Prim.Ref.take" {
         return Ok(row.arity as usize);
     }

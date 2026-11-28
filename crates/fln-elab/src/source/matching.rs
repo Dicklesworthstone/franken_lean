@@ -13,6 +13,7 @@ use fln_env::constants::ConstantInfo;
 use fln_env::constants::ConstructorVal;
 use std::collections::{HashMap, HashSet};
 mod conditional_order;
+mod infer_family;
 mod mutual;
 mod nomatch;
 pub(in crate::source) mod split_info;
@@ -616,6 +617,7 @@ impl Context {
         } else {
             expected
         };
+        self.infer_match_family(&parts, &major.type_)?;
         // A match as written is refused where the pin refuses its patterns' types; the lowering
         // below would solve index equations the pin leaves alone (`pattern_typing`).
         if parts.written && parts.equation.is_none() && parts.conditional.is_none() {
@@ -982,8 +984,7 @@ impl Context {
             order,
             split_info,
         } = self.match_patterns(parts, name, &family.ctors, &family_type)?;
-        let split_info =
-            split_info.filter(|_| !recursive && family.num_indices == 0 && rec.num_motives == 1);
+        let split_info = split_info.filter(|_| !recursive && rec.num_motives == 1);
         let fallback_position = order.len();
         let positions: HashMap<_, _> = order
             .into_iter()
@@ -1744,6 +1745,9 @@ impl Context {
                     )?;
                 }
             }
+            if let Some(info) = &state.split_info {
+                result.value = Expr::mdata(info.clone(), result.value);
+            }
             if let Some(obligation) = &state.motive_obligation {
                 result.value = Expr::let_e(
                     Name::anonymous(),
@@ -1752,9 +1756,6 @@ impl Context {
                     result.value,
                     false,
                 );
-            }
-            if let Some(info) = &state.split_info {
-                result.value = Expr::mdata(info.clone(), result.value);
             }
             return Ok(MatchStep::Complete(
                 self.finish_term(result, Some(&state.target))?,

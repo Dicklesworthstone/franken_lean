@@ -1490,11 +1490,27 @@ fn boxed_data_ir_facets_build_import_and_execute_payloads() {
             "module\nprelude\npublic import Init.Notation\n",
             "public structure Lib.Payload where\n  number : Nat\n  text : String\n",
             "public inductive Lib.Message where\n  | empty\n  | value (number : Nat) (text : String)\n",
+            "public structure Lib.NatBox where\n  value : Nat\n",
+            "public structure Lib.StringBox where\n  value : String\n",
+            "public structure Lib.BoolBox where\n  value : Bool\n",
             "public def Lib.makePayload (number : Nat) (text : String) : Lib.Payload := Lib.Payload.mk number text\n",
         ),
     );
     let top = concat!(
         "module\nprelude\npublic import Lib.Base\n",
+        // Preserve the exact declarations previously listed as unsupported.
+        "public structure Lib.Packed where\n  flag : Bool\n  number : Nat\n",
+        "public def Lib.bad (p : Lib.Packed) : Lib.Packed := p\n",
+        "public def Lib.makePacked (flag : Bool) (number : Nat) : Lib.Packed := Lib.Packed.mk flag number\n",
+        "public def Lib.packedFlag (p : Lib.Packed) : Bool := p.flag\n",
+        "public def Lib.packedNumber (p : Lib.Packed) : Nat := p.number\n",
+        "public def Lib.makeNatBox (n : Nat) : Lib.NatBox := Lib.NatBox.mk n\n",
+        "public def Lib.readNatBox (p : Lib.NatBox) : Nat := p.value\n",
+        "public def Lib.makeStringBox (s : String) : Lib.StringBox := Lib.StringBox.mk s\n",
+        "public def Lib.readStringBox (p : Lib.StringBox) : String := p.value\n",
+        "public def Lib.keepStringBox (p : Lib.StringBox) : Lib.StringBox := p\n",
+        "public def Lib.makeBoolBox (b : Bool) : Lib.BoolBox := Lib.BoolBox.mk b\n",
+        "public def Lib.readBoolBox (p : Lib.BoolBox) : Bool := match p with | .mk b => b\n",
         "public def Lib.payloadIdentity (p : Lib.Payload) : Lib.Payload := p\n",
         "public def Lib.payloadText (p : Lib.Payload) : String := p.text\n",
         "public def Lib.applyPayload (f : Lib.Payload -> Lib.Payload) (p : Lib.Payload) : Lib.Payload := f p\n",
@@ -1563,6 +1579,17 @@ fn boxed_data_ir_facets_build_import_and_execute_payloads() {
             "  let keepNumber ← fetch (Lib.Payload -> Nat -> Nat) env `Lib.keepNumber\n",
             "  let reduced ← fetch (Nat -> Nat) env `Lib.keepNumber._redArg\n",
             "  let ordinary ← fetch (Nat -> Nat) env `Lib.user.recOn\n",
+            "  let makePacked ← fetch (Bool -> Nat -> Lib.Packed) env `Lib.makePacked\n",
+            "  let keepPacked ← fetch (Lib.Packed -> Lib.Packed) env `Lib.bad\n",
+            "  let packedFlag ← fetch (Lib.Packed -> Bool) env `Lib.packedFlag\n",
+            "  let packedNumber ← fetch (Lib.Packed -> Nat) env `Lib.packedNumber\n",
+            "  let makeNatBox ← fetch (Nat -> Lib.NatBox) env `Lib.makeNatBox\n",
+            "  let readNatBox ← fetch (Lib.NatBox -> Nat) env `Lib.readNatBox\n",
+            "  let makeStringBox ← fetch (String -> Lib.StringBox) env `Lib.makeStringBox\n",
+            "  let readStringBox ← fetch (Lib.StringBox -> String) env `Lib.readStringBox\n",
+            "  let keepStringBox ← fetch (Lib.StringBox -> Lib.StringBox) env `Lib.keepStringBox\n",
+            "  let makeBoolBox ← fetch (Bool -> Lib.BoolBox) env `Lib.makeBoolBox\n",
+            "  let readBoolBox ← fetch (Lib.BoolBox -> Bool) env `Lib.readBoolBox\n",
             "  let p := make large heap\n",
             "  let q := keep p\n",
             "  IO.println (reprStr (q.number, q.text, p.text))\n",
@@ -1574,6 +1601,16 @@ fn boxed_data_ir_facets_build_import_and_execute_payloads() {
             "  IO.println (keepNumber p 42)\n",
             "  IO.println (reduced 43)\n",
             "  IO.println (ordinary 44)\n",
+            "  let packed := makePacked true large\n",
+            "  let packedCopy := keepPacked packed\n",
+            "  IO.println (reprStr (packedFlag packedCopy, packedNumber packedCopy, packed.number))\n",
+            "  IO.println (reprStr (packedFlag (makePacked false large), packedNumber packed))\n",
+            "  let numberBox := makeNatBox large\n",
+            "  IO.println (reprStr (readNatBox numberBox, numberBox.value))\n",
+            "  let stringBox := makeStringBox heap\n",
+            "  let stringCopy := keepStringBox stringBox\n",
+            "  IO.println (reprStr (readStringBox stringCopy, readStringBox stringBox, heap))\n",
+            "  IO.println (reprStr (readBoolBox (makeBoolBox false), readBoolBox (makeBoolBox true)))\n",
         ),
     );
     let output = Command::new(&reference)
@@ -1595,6 +1632,11 @@ fn boxed_data_ir_facets_build_import_and_execute_payloads() {
             "(184467440737095516160, \"boxed heap payload\", \"boxed heap payload\")\n",
             "(184467440737095516161, \"boxed heap payload!\", \"boxed heap payload\")\n",
             "boxed heap payload\nboxed heap payload\nempty\n42\n43\n44\n",
+            "(true, 184467440737095516160, 184467440737095516160)\n",
+            "(false, 184467440737095516160)\n",
+            "(184467440737095516160, 184467440737095516160)\n",
+            "(\"boxed heap payload\", \"boxed heap payload\", \"boxed heap payload\")\n",
+            "(false, true)\n",
         ),
     );
     let snapshot = package.0.join(".lake/build/fln-build.snapshot");
@@ -1603,7 +1645,7 @@ fn boxed_data_ir_facets_build_import_and_execute_payloads() {
         (
             concat!(
                 "module\nprelude\npublic import Lib.Base\n",
-                "public structure Lib.Packed where\n  flag : Bool\n  number : Nat\n",
+                "public structure Lib.Packed where\n  flag : Bool\n  number : Nat\n  proof : True\n",
                 "public def Lib.bad (p : Lib.Packed) : Lib.Packed := p\n",
             ),
             "source export carrier",
@@ -1670,7 +1712,7 @@ fn unsupported_ir_facet_preserves_the_previous_admission_artifacts() {
     let package = module_library();
     package.write(
         "Lib/Base.lean",
-        MODULE_BASE.replace(" | right\n", " | right (previous : Token)\n"),
+        MODULE_BASE.replace(" | right\n", " | right (previous : Prop -> Token)\n"),
     );
     success(&package.build(&["+Lib.Top:olean"]));
     let previous: Vec<_> = ["Lib.Base", "Lib.Top"]

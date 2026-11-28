@@ -283,7 +283,7 @@ impl Context {
         let Some(type_) = self.known_type(value)? else {
             return Ok(false);
         };
-        // Reconstructed function types retain raw imax levels. As in the pin's
+        // Imported and local types can retain raw imax levels. As in the pin's
         // Meta.isProp, an implication is a proposition when that level is
         // always zero, even if it is not the literal Zero constructor.
         Ok(matches!(self.whnf(&type_)?.node(), ExprNode::Sort { level } if level.is_always_zero()))
@@ -914,6 +914,7 @@ mod tests {
         let proposition = parameter("P", Level::zero());
         let conclusion = parameter("Q", Level::zero());
         let data = parameter("T", Level::one());
+        let raw_proposition = parameter("R", Level::imax(Level::one(), Level::zero()).unwrap());
         let implication = Expr::forall_e(
             Name::anonymous(),
             proposition.clone(),
@@ -921,9 +922,12 @@ mod tests {
             BinderInfo::Default,
         );
         let inferred = context.known_type(&implication).unwrap().unwrap();
+        assert!(matches!(inferred.node(), ExprNode::Sort { level } if level.is_zero()));
+        assert!(context.omega_is_proposition(&implication).unwrap());
+        let inferred = context.known_type(&raw_proposition).unwrap().unwrap();
         assert!(matches!(inferred.node(), ExprNode::Sort { level }
             if !level.is_zero() && level.is_always_zero()));
-        assert!(context.omega_is_proposition(&implication).unwrap());
+        assert!(context.omega_is_proposition(&raw_proposition).unwrap());
         let data_function =
             Expr::forall_e(Name::anonymous(), proposition, data, BinderInfo::Default);
         assert!(!context.omega_is_proposition(&data_function).unwrap());

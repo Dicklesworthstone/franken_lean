@@ -5,6 +5,8 @@ use fln_core::expr::{BinderInfo, FVarId, Literal, MVarId, NatLit};
 use fln_core::name::Name;
 use fln_core::outcome::Outcome;
 
+mod ordering;
+
 fn bvar(index: u32) -> Expr {
     Expr::bvar(index).unwrap()
 }
@@ -84,6 +86,8 @@ fn program(row: &str) -> flbc::ValidatedProgram {
                     row,
                     "extern:Lean.Expr.equal"
                         | "extern:Lean.Expr.eqv"
+                        | "extern:Lean.Expr.lt"
+                        | "extern:Lean.Expr.quickLt"
                         | "extern:Lean.Expr.hasLooseBVar"
                 ) {
                     CallableResultOwnership::Scalar

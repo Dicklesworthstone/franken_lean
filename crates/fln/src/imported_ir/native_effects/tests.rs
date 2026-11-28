@@ -234,7 +234,23 @@ fn only_reviewed_local_cell_effects_are_newly_admitted() {
     }
     let mut refused = 0;
     for row in EXTERN_ROWS {
-        if row.effect == "pure" || CELL_ROWS.contains(&row.name) || row.name == "ST.Prim.Ref.take" {
+        if row.effect == "pure"
+            || CELL_ROWS.contains(&row.name)
+            || matches!(
+                row.name,
+                "ST.Prim.Ref.take"
+                    | "Task.pure"
+                    | "Task.spawn"
+                    | "Task.map"
+                    | "Task.bind"
+                    | "BaseIO.asTask"
+                    | "BaseIO.mapTask"
+                    | "BaseIO.bindTask"
+                    | "IO.wait"
+                    | "IO.getTaskState"
+                    | "IO.waitAny"
+            )
+        {
             continue;
         }
         assert!(

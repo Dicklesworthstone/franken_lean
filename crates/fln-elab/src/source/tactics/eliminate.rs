@@ -38,8 +38,9 @@ pub(super) enum EliminationSyntax<'a> {
     EmptyMatrix(HashMap<Name, Vec<Name>>),
     /// Recursive tactic patterns retain the ordinary cases removal semantics.
     RCases(HashMap<Name, Vec<Name>>),
-    /// A source match's splitter keeps an inaccessible copy of the original input, while
-    /// the target and its dependency cone are specialized at each constructor.
+    /// A source match's splitter keeps inaccessible copies of the original dependency
+    /// telescope. Its specialized locals are inaccessible too; a selected hypothesis and
+    /// its forward dependencies are reverted before this elimination and introduced after it.
     SplitMatch {
         fields: HashMap<Name, Vec<Name>>,
         original: Name,
@@ -1063,7 +1064,7 @@ impl Context {
             }
             preceding_indices.insert(index.id.clone());
         }
-        let reverted: Vec<_> = goal
+        let mut reverted: Vec<_> = goal
             .lctx
             .decls()
             .iter()
@@ -1082,16 +1083,26 @@ impl Context {
                 local
             })
             .collect();
+        if matches!(input, EliminationSyntax::SplitMatch { .. }) {
+            for local in &mut reverted {
+                local.user_name = self.fresh_inaccessible(&local.user_name)?;
+            }
+        }
         let mut retained = LocalContext::new();
         for local in goal.lctx.decls() {
             if !removed.contains(&local.id) {
                 add_local(&mut retained, local);
-            } else if local.id == major.id
-                && let EliminationSyntax::SplitMatch { original, .. } = input
-            {
-                let mut original_local = local.clone();
-                original_local.user_name = original.clone();
-                add_local(&mut retained, &original_local);
+            } else if let EliminationSyntax::SplitMatch { original, .. } = input {
+                // The original input keeps its original type and dependency telescope.
+                // A selected hypothesis's entire forward cone has already been reverted,
+                // so retaining this whole telescope cannot leave a dangling dependency.
+                let mut hidden = local.clone();
+                hidden.user_name = if local.id == major.id {
+                    original.clone()
+                } else {
+                    self.fresh_inaccessible(&local.user_name)?
+                };
+                add_local(&mut retained, &hidden);
             } else if rec.num_motives > 1 && (local.id == major.id || index_ids.contains(&local.id))
             {
                 // Sibling motives may mention the original input in R -> R.

@@ -390,6 +390,106 @@ theorem split_enumeration_source_order (s : Side) : match s with | .left => True
   split <;> exact True.intro
 "#;
 
+/// Indexed constructor alternatives refine the indices in both the target and its dependent
+/// context. The recursive vector also checks that hidden induction hypotheses and the retained
+/// original discriminant stay well scoped; the two-index family checks the recursor position.
+const INDEXED_MATCH_PROOFS: &str = r#"prelude
+import Init.SimpLemmas
+set_option linter.unusedVariables false
+inductive SplitFlag : Bool → Type where
+  | off : SplitFlag false
+  | on : SplitFlag true
+theorem split_indexed_flag (b : Bool) (s : SplitFlag b) :
+    (match s with | .off => false | .on => true) = b := by
+  split <;> rfl
+theorem split_indexed_dependent_hypothesis (b : Bool) (s : SplitFlag b)
+    (P : Bool → Prop) (h : P b) :
+    match s with | .on => P true | .off => P false := by
+  split <;> assumption
+theorem split_indexed_selected_hypothesis (b : Bool) (s : SplitFlag b)
+    (P : Bool → Prop) (q : P b)
+    (h : match s with | .on => P true | .off => P false) : P b := by
+  split at h <;> exact h
+inductive SplitVec (α : Type) : Nat → Type where
+  | nil : SplitVec α 0
+  | cons (n : Nat) (head : α) (tail : SplitVec α n) : SplitVec α (Nat.succ n)
+theorem split_indexed_length {α : Type} (n : Nat) (xs : SplitVec α n) :
+    (match xs with | .nil => 0 | .cons k a tail => Nat.succ k) = n := by
+  split <;> rfl
+theorem split_indexed_reconstruction {α : Type} (n : Nat) (xs : SplitVec α n) :
+    ((match xs with | .nil => SplitVec.nil | .cons k a tail => SplitVec.cons k a tail) : SplitVec α n) = xs := by
+  split <;> rfl
+theorem split_indexed_hypothesis_source_order (n : Nat) (xs : SplitVec Nat n)
+    (h : match xs with | .cons k a tail => a = 0 | .nil => False) :
+    match xs with | .nil => False | .cons k a tail => a = 0 := by
+  split at h
+  next k a tail => exact h
+  next => exact False.elim h
+theorem split_indexed_forward_hypothesis {α : Type} (n : Nat) (xs : SplitVec α n)
+    (h : match xs with | .nil => False | .cons k a tail => True) (q : h = h) : True := by
+  split at h <;> exact True.intro
+theorem split_match_dependent_target (b : Bool)
+    (h : match b with | true => True | false => True) : h = h := by
+  split at h <;> rfl
+theorem split_match_transitive_dependencies (b : Bool)
+    (h : match b with | true => True | false => True) (q : h = h) (r : q = q) : q = q := by
+  split at h <;> exact r
+theorem split_match_dependent_let (b : Bool)
+    (h : match b with | true => True | false => True) : True := by
+  let q := h
+  have r : q = q := rfl
+  have checked : q = q := by
+    split at h <;> exact r
+  exact True.intro
+theorem split_indexed_under_binder {α : Type} (n : Nat) (xs : SplitVec α n) :
+    ∀ y : Nat, (match xs with | .nil => y | .cons k a tail => y) = y := by
+  split <;> intro y <;> rfl
+inductive SplitTwo : Bool → Nat → Type where
+  | zero : SplitTwo false 0
+  | step (n : Nat) : SplitTwo true (Nat.succ n)
+theorem split_two_indices (b : Bool) (n : Nat) (s : SplitTwo b n) :
+    (match s with | .step k => Nat.succ k | .zero => 0) = n := by
+  split <;> rfl
+"#;
+
+const INDEXED_MATCH_FAMILY: &str =
+    "inductive SplitFlag : Bool → Type where\n  | off : SplitFlag false\n  | on : SplitFlag true\n";
+
+/// Each failing proof must reach both constructor obligations. A false branch, an omitted
+/// branch, or a false claim about the resulting index must never be discharged by metadata.
+/// Other index-dependent hypotheses become inaccessible; the selected hypothesis's forward
+/// dependency telescope keeps its names.
+const INDEXED_MATCH_REFUSALS: &[(&str, &str)] = &[
+    (
+        "IndexedFalseBranch.lean",
+        "example (b : Bool) (s : SplitFlag b) : (match s with | .off => True | .on => False) := by\n  split <;> exact True.intro\n",
+    ),
+    (
+        "IndexedMissingBranch.lean",
+        "example (b : Bool) (s : SplitFlag b) : (match s with | .off => True | .on => True) := by\n  split\n  exact True.intro\n",
+    ),
+    (
+        "IndexedWrongIndex.lean",
+        "example (b : Bool) (s : SplitFlag b) : (match s with | .off => false | .on => true) = false := by\n  split <;> rfl\n",
+    ),
+    (
+        "IndexedHiddenHypothesis.lean",
+        "example (b : Bool) (s : SplitFlag b) (P : Bool → Prop) (h : P b) : (match s with | .on => P true | .off => P false) := by\n  split <;> exact h\n",
+    ),
+    (
+        "IndexedHiddenSibling.lean",
+        "example (b : Bool) (s : SplitFlag b) (P : Bool → Prop) (q : P b) (h : match s with | .on => P true | .off => P false) : P b := by\n  split at h <;> exact q\n",
+    ),
+    (
+        "DependentFalseBranch.lean",
+        "example (b : Bool) (h : match b with | true => True | false => True) (q : h = h) : False := by\n  split at h <;> exact True.intro\n",
+    ),
+    (
+        "DependentMissingBranch.lean",
+        "example (b : Bool) (h : match b with | true => True | false => True) (q : h = h) : True := by\n  split at h\n  exact True.intro\n",
+    ),
+];
+
 /// Computed discriminants are generalized only at their matcher applications. The ordinary
 /// occurrences in branch bodies, the rest of the target and existing hypotheses stay fixed;
 /// the generated equality is the evidence relating each constructor to the original term.
@@ -705,6 +805,91 @@ fn split_constructor_matches_checks_native_seed_proofs_and_every_branch() {
             "the negative control must split the match: {error:?}"
         );
         assert_eq!(base.logical_root(&options), root);
+    }
+}
+
+#[test]
+fn split_indexed_matches_checks_native_proofs_and_every_branch() {
+    let limits = fln::SourceCheckLimits::new(fln::EngineAdmissionLimits::new(
+        fln::Budget::for_stack_bytes(8 * 1024 * 1024),
+    ));
+    let options = fln::KVMap::new();
+    let base = fln::Engine::with_source_seed(limits.admission)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let root = base.logical_root(&options);
+    let program = INDEXED_MATCH_PROOFS
+        .strip_prefix("prelude\nimport Init.SimpLemmas\nset_option linter.unusedVariables false\n")
+        .expect("only the shared fixture's import header is removed");
+    let checked = base
+        .check_source_files(&[program.as_bytes()], &options, limits)
+        .unwrap_or_else(|error| panic!("{program}\n{error:?}"))
+        .into_complete()
+        .unwrap();
+    assert_eq!(
+        checked.theorems, 12,
+        "every indexed branch supplies a proof"
+    );
+    assert_eq!(base.logical_root(&options), root);
+    for (name, body) in INDEXED_MATCH_REFUSALS {
+        let program = format!("{INDEXED_MATCH_FAMILY}{body}");
+        let error = base
+            .check_source_files(&[program.as_bytes()], &options, limits)
+            .expect_err("false or unfinished indexed branches must reject the theorem");
+        let diagnostic = format!("{error:?}");
+        assert!(
+            !diagnostic.contains("SplitMatchUnsupported"),
+            "{name} must reach its constructor proof obligations: {error:?}"
+        );
+        if name.starts_with("IndexedHidden") {
+            assert!(
+                diagnostic.contains("UnknownConstant"),
+                "{name} must reject the hidden source name: {error:?}"
+            );
+        }
+        assert_eq!(base.logical_root(&options), root);
+    }
+    // Metadata must not bypass the remaining capability boundaries: specialized indices,
+    // computed indexed majors, or a computed discriminant with a dependent selected hypothesis.
+    for body in [
+        "example (b : Bool) (s : SplitFlag b) :\n  (match s with | .off => false | .on => true) = b := by\n  cases b\n  all_goals split\n  all_goals rfl\n",
+        "example (b : Bool) (f : Nat → SplitFlag b) (x : Nat) :\n  (match f x with | .off => false | .on => true) = b := by\n  split <;> rfl\n",
+        "example (f : Nat → Bool) (x : Nat) (h : match f x with | true => True | false => True) (q : h = h) : True := by\n  split at h <;> exact True.intro\n",
+    ] {
+        let program = format!("{INDEXED_MATCH_FAMILY}{body}");
+        let error = base
+            .check_source_files(&[program.as_bytes()], &options, limits)
+            .expect_err(
+                "constrained or computed dependent matchers still need equality refinement",
+            );
+        assert!(
+            format!("{error:?}").contains("SplitMatchUnsupported"),
+            "constrained or computed dependent matches must retain a typed refusal: {error:?}"
+        );
+        assert_eq!(base.logical_root(&options), root);
+    }
+}
+
+#[test]
+fn split_indexed_matches_matches_the_pin() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    accepted(&lib, &root, "IndexedMatches.lean", INDEXED_MATCH_PROOFS, "");
+    for (name, body) in INDEXED_MATCH_REFUSALS {
+        let program = format!("prelude\nimport Init.SimpLemmas\n{INDEXED_MATCH_FAMILY}{body}");
+        std::fs::write(root.join(name), program).unwrap();
+        if let Some((code, stdout)) = pinned(&lib, &root, name) {
+            assert_eq!(code, 1, "{name}: the pin moved: {stdout}");
+        }
+        let (code, stdout, stderr) = ours(&lib, &root, name);
+        assert_eq!(code, 1, "{name}: {stdout}{stderr}");
+        assert!(
+            !stderr.contains("split on a `match` expression is not implemented"),
+            "{name} must reach its constructor proof obligations: {stderr}"
+        );
     }
 }
 

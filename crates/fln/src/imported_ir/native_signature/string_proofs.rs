@@ -133,7 +133,7 @@ pub(super) fn erased_operands(
 ) -> Result<Option<ErasedOperands>, IrExecutionError> {
     Ok(signature(row)?.map(|_| ErasedOperands {
         runtime: 2,
-        type_prefix: false,
+        type_prefix: 0,
         proof_suffix: 1,
     }))
 }

@@ -169,6 +169,27 @@ jobs:
             2>&1 | tee target/imported-ir-reference/primitive-prototypes.log || status=1
           grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' \
             target/imported-ir-reference/primitive-prototypes.log || status=1
+          cargo test --locked -p fln-vm --test runtime_tasks --no-fail-fast \
+            -- --nocapture --test-threads=1 \
+            2>&1 | tee target/imported-ir-reference/task-callback-vm.log || status=1
+          grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' \
+            target/imported-ir-reference/task-callback-vm.log || status=1
+          cargo test --locked -p fln --lib native_signature::tests::tasks:: --no-fail-fast \
+            -- --nocapture --test-threads=1 \
+            2>&1 | tee target/imported-ir-reference/task-native-signatures.log || status=1
+          grep -Fq 'test imported_ir::native_signature::tests::tasks::live_pinned_task_ir_preserves_native_prototypes_partial_calls_and_universes' \
+            target/imported-ir-reference/task-native-signatures.log || status=1
+          grep -Eq '^test result: ok\. 4 passed; 0 failed; 0 ignored;' \
+            target/imported-ir-reference/task-native-signatures.log || status=1
+          cargo test --locked -p fln --test source_auto_parameters --test runtime_tasks --no-fail-fast \
+            -- --nocapture --test-threads=1 \
+            2>&1 | tee target/imported-ir-reference/source-auto-and-tasks.log || status=1
+          grep -Fq 'test source_data_and_proof_defaults_execute_through_the_public_vm_path' \
+            target/imported-ir-reference/source-auto-and-tasks.log || status=1
+          grep -Fq 'test public_module_headers_preserve_checked_tactic_quotation_predecessors' \
+            target/imported-ir-reference/source-auto-and-tasks.log || status=1
+          grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' \
+            target/imported-ir-reference/source-auto-and-tasks.log || status=1
           exit "$status"
       - name: Materialize and verify the pinned execution partition
         shell: bash

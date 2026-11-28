@@ -66,8 +66,7 @@ impl Context {
             || family.is_unsafe
             || family.num_nested != 0
             || rec.num_motives != 1
-            || rec.num_indices != 0
-            || family.num_indices != 0
+            || rec.num_indices != family.num_indices
             || rec.num_params != family.num_params
             || rec.all != family.all
             || rec.num_minors as usize != family.ctors.len()
@@ -100,6 +99,7 @@ impl Context {
             .ok()
             .and_then(|parameters| parameters.checked_add(1))
             .and_then(|prefix| prefix.checked_add(rec.num_minors as usize))
+            .and_then(|prefix| prefix.checked_add(rec.num_indices as usize))
             .ok_or_else(unsupported)?;
         let discriminant = self.instantiate(arguments.get(position).ok_or_else(unsupported)?)?;
         if discriminant.has_loose_bvars() {
@@ -113,29 +113,66 @@ impl Context {
             return Err(unsupported());
         }
         let type_ = self.known_type(&discriminant)?.ok_or_else(unsupported)?;
+        if rec.num_indices != 0 {
+            // Ordinary elimination can specialize independent local indices directly.
+            // A fixed/repeated index or a computed major needs the splitter's index
+            // equations, whose refinement may close constructors and reorder its work.
+            // Do not treat such a problem as one obligation per constructor.
+            if !matches!(discriminant.node(), ExprNode::FVar { .. }) {
+                return Err(unsupported());
+            }
+            let values = self.elimination_result_indices(
+                &type_,
+                family_name,
+                family.num_params as usize,
+                family.num_indices as usize,
+            )?;
+            let indices = match self.elimination_index_locals(&values) {
+                Ok(indices) => indices,
+                Err(NatDefinitionElabError::Inference(SourceInferenceError::Match(
+                    matching::MatchError::UnrefinedIndices,
+                ))) => return Err(unsupported()),
+                Err(error) => return Err(error),
+            };
+            let index_ids = indices
+                .iter()
+                .map(|index| index.id.clone())
+                .collect::<HashSet<_>>();
+            for parameter in &arguments[..rec.num_params as usize] {
+                if !self.elimination_reads(parameter)?.is_disjoint(&index_ids) {
+                    return Err(unsupported());
+                }
+            }
+        }
         let prefix = arguments[..position]
             .iter()
             .cloned()
             .fold(head.clone(), Expr::app);
         if let Subject::Hypothesis(local) = subject {
-            // The pin does not simplify a reverted binder's type if later binders depend
-            // on it. Keep this case typed until its congruence behavior is implemented.
-            if local.value.is_some() || self.elimination_reads(&goal.target)?.contains(&local.id) {
+            if local.value.is_some() {
                 return Err(unsupported());
             }
-            for other in goal.lctx.decls() {
-                if other.id == local.id {
-                    continue;
-                }
-                if self.elimination_reads(&other.type_)?.contains(&local.id)
-                    || other
-                        .value
-                        .as_ref()
-                        .map(|value| self.elimination_reads(value))
-                        .transpose()?
-                        .is_some_and(|reads| reads.contains(&local.id))
-                {
+            if !matches!(discriminant.node(), ExprNode::FVar { .. }) {
+                // A computed discriminant additionally changes the selected matcher's
+                // applications. Keep dependent selected hypotheses typed until that
+                // generalization is validated together with their full telescope.
+                if self.elimination_reads(&goal.target)?.contains(&local.id) {
                     return Err(unsupported());
+                }
+                for other in goal.lctx.decls() {
+                    if other.id == local.id {
+                        continue;
+                    }
+                    if self.elimination_reads(&other.type_)?.contains(&local.id)
+                        || other
+                            .value
+                            .as_ref()
+                            .map(|value| self.elimination_reads(value))
+                            .transpose()?
+                            .is_some_and(|reads| reads.contains(&local.id))
+                    {
+                        return Err(unsupported());
+                    }
                 }
             }
         }
@@ -180,7 +217,18 @@ impl Context {
                 .collect::<Result<Vec<_>, _>>()?;
             fields.insert(alternative.constructor.clone(), names);
         }
-        let (goal, major) = self.split_match_discriminant(proof, goal, subject, &plan)?;
+        // As `splitLocalDecl?` at the pin, first close the selected hypothesis and its
+        // entire dependency cone into the target. Splitting that checked telescope lets
+        // ordinary congruence decide which binder types can be reduced; a domain read by
+        // a later binder or the goal stays unchanged. Reintroducing the cone afterward
+        // preserves the original names, let values and dependencies without retyping locals.
+        let (goal, reverted) = match subject {
+            Subject::Target => (goal, Vec::new()),
+            Subject::Hypothesis(local) => {
+                self.reverted_proof_goal(proof, goal, HashSet::from([local.id.clone()]))?
+            }
+        };
+        let (goal, major) = self.split_match_discriminant(proof, goal, &plan)?;
         let original = self.fresh_inaccessible(&major.user_name)?;
         self.txn.lctx = goal.lctx.clone();
         let start = proof.work.len();
@@ -192,7 +240,7 @@ impl Context {
             Some(&major.id),
             None,
         )?;
-        // Nonindexed ordinary elimination emits one close followed by its constructor goals,
+        // Independent-index elimination emits one close followed by its constructor goals,
         // in reverse worklist order. Reordering the goals never reorders recursor arguments.
         let mut generated = proof.work.split_off(start);
         if generated.len() != plan.constructors.len() + 1 {
@@ -204,38 +252,14 @@ impl Context {
                 return Err(unsupported());
             };
             self.txn.lctx = branch.lctx.clone();
-            match subject {
-                Subject::Target => {
-                    let reduced = self.split_reduce_match(&branch.target, &plan)?;
-                    self.constrain(&branch.target, &reduced)?;
-                    self.flush(false)?;
-                    branch.target = reduced;
-                }
-                Subject::Hypothesis(local) => {
-                    let local = branch
-                        .lctx
-                        .find_by_user_name(&local.user_name)
-                        .cloned()
-                        .ok_or_else(unsupported)?;
-                    let reduced = self.split_reduce_match(&local.type_, &plan)?;
-                    self.constrain(&local.type_, &reduced)?;
-                    self.flush(false)?;
-                    let mut context = LocalContext::new();
-                    for other in branch.lctx.decls() {
-                        let mut other = other.clone();
-                        if other.id == local.id {
-                            other.type_ = reduced.clone();
-                        }
-                        eliminate::add_local(&mut context, &other);
-                    }
-                    for introduced in &mut branch.introduced {
-                        if introduced.id == local.id {
-                            introduced.type_ = reduced.clone();
-                        }
-                    }
-                    branch.lctx = context;
-                }
+            let reduced = self.split_reduce_match(&branch.target, &plan)?;
+            self.constrain(&branch.target, &reduced)?;
+            self.flush(false)?;
+            branch.target = reduced;
+            for local in &reverted {
+                self.introduce_proof_binder(&mut branch, local.user_name.clone())?;
             }
+            branch.lctx = self.txn.lctx.clone();
             branches.insert(constructor.clone(), branch);
         }
         let Some(close @ Work::Close(..)) = generated.pop() else {
@@ -268,21 +292,12 @@ impl Context {
         &mut self,
         proof: &mut ProofState<'_>,
         goal: ProofGoal,
-        subject: &Subject,
         plan: &MatchPlan,
     ) -> Result<(ProofGoal, LocalDecl), NatDefinitionElabError> {
         if let ExprNode::FVar { id } = plan.discriminant.value.node() {
             let local = goal.lctx.find(id).cloned().ok_or_else(unsupported)?;
             return Ok((goal, local));
         }
-        // A selected hypothesis is generalized in a checked telescope, never retyped in
-        // place. The caller has already refused forward dependencies on this hypothesis.
-        let (goal, reverted) = match subject {
-            Subject::Target => (goal, Vec::new()),
-            Subject::Hypothesis(local) => {
-                self.reverted_proof_goal(proof, goal, HashSet::from([local.id.clone()]))?
-            }
-        };
         let discriminant_name = self.fresh_inaccessible(&name(&["x"]))?;
         let equation = self.fresh_inaccessible(&name(&["h"]))?;
         let (mut goal, id) = self.generalized_proof_goal_with(
@@ -295,9 +310,6 @@ impl Context {
                 context.split_generalize_match(target, plan, expression, marker)
             },
         )?;
-        for local in reverted {
-            self.introduce_proof_binder(&mut goal, local.user_name)?;
-        }
         goal.lctx = self.txn.lctx.clone();
         let major = goal.lctx.find(&id).cloned().ok_or_else(unsupported)?;
         Ok((goal, major))

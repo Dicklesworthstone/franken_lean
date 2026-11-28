@@ -41,12 +41,35 @@ structure WriterRecord where
 inductive WriterHeap where | text (s : String) | number (n : Nat)
 inductive WriterBinders where | empty | data {n : Nat} {{s : String}}
 inductive WriterWrapper where | mk (n : Nat)
+structure WriterStringWrapper where
+  value : String
 inductive WriterBorrowed where | mk (n : @& Nat) (s : String)
 inductive WriterScalar where | mk (b : Bool) (n : Nat)
+structure WriterInterleaved where
+  first : Bool
+  number : Nat
+  second : Bool
+  text : String
+structure WriterAllBools where
+  first : Bool
+  second : Bool
+  third : Bool
+inductive WriterScalarSum where | empty | value (b : Bool)
+inductive WriterScalarHeap where | bit (b : Bool) | text (s : String)
+inductive WriterBoolWrapper where | mk (b : Bool)
+inductive WriterWideScalar where | mk (b : UInt32) (n : Nat)
 inductive WriterProof where | mk (p : True) (n : Nat)
 inductive WriterParam (α : Type) where | mk (value : α)
 inductive WriterIndexed : Nat → Type where | zero : WriterIndexed 0
 inductive WriterRecursive where | stop | next (tail : WriterRecursive)
+inductive WriterRecursiveHeap where
+  | leaf (n : Nat) (s : String)
+  | node (left : WriterRecursiveHeap) (flag : Bool) (right : WriterRecursiveHeap)
+inductive WriterRecursiveFirst where
+  | next (tail : WriterRecursiveFirst) (flag : Bool) (n : Nat)
+  | stop
+inductive WriterRecursiveOnly where | next (tail : WriterRecursiveOnly)
+inductive WriterHigherRecursive where | node (children : Nat → WriterHigherRecursive)
 inductive WriterProp : Prop where | intro
 "#;
 
@@ -80,7 +103,7 @@ fn fixture() -> Option<(PathBuf, PathBuf, Vec<u8>)> {
     std::fs::write(directory.join("WriterData.lean"), SOURCE).unwrap();
     let output = Command::new(&lean)
         .current_dir(&directory)
-        .args(["-o", "WriterData.olean", "WriterData.lean"])
+        .args(["-j", "1", "-o", "WriterData.olean", "WriterData.lean"])
         .output()
         .unwrap();
     assert!(
@@ -109,6 +132,239 @@ fn projection(constants: &[ConstantInfo]) -> Vec<CompilerData> {
             .unwrap()
         })
         .collect()
+}
+
+fn closed_family(
+    family: &str,
+    recursive: bool,
+    fields: Vec<Vec<Expr>>,
+) -> (InductiveVal, Vec<ConstantInfo>) {
+    use fln_env::constants::{ConstantVal, ConstructorVal};
+
+    let family = name(family);
+    let constructors: Vec<_> = fields
+        .into_iter()
+        .enumerate()
+        .map(|(index, fields)| {
+            let num_fields = fields.len() as u32;
+            let ty = fields.into_iter().enumerate().rev().fold(
+                Expr::const_(family.clone(), Vec::new()),
+                |body, (field, ty)| {
+                    Expr::forall_e(
+                        Name::num(Name::anonymous(), field as u64),
+                        ty,
+                        body,
+                        BinderInfo::Default,
+                    )
+                },
+            );
+            ConstantInfo::Ctor(ConstructorVal {
+                base: ConstantVal {
+                    name: Name::str(family.clone(), format!("ctor{index}")),
+                    level_params: Vec::new(),
+                    type_: ty,
+                },
+                induct: family.clone(),
+                cidx: index as u32,
+                num_params: 0,
+                num_fields,
+                is_unsafe: false,
+            })
+        })
+        .collect();
+    let inductive = InductiveVal {
+        base: ConstantVal {
+            name: family.clone(),
+            level_params: Vec::new(),
+            type_: Expr::sort(Level::one()),
+        },
+        num_params: 0,
+        num_indices: 0,
+        all: vec![family],
+        ctors: constructors
+            .iter()
+            .map(|ctor| ctor.name().clone())
+            .collect(),
+        num_nested: 0,
+        is_rec: recursive,
+        is_unsafe: false,
+        is_reflexive: false,
+    };
+    (inductive, constructors)
+}
+
+fn project_closed(inductive: &InductiveVal, constructors: &[ConstantInfo]) -> Option<CompilerData> {
+    CompilerData::from_inductive(
+        inductive,
+        |name| {
+            constructors
+                .iter()
+                .find(|constructor| constructor.name() == name)
+        },
+        |_| Ok::<_, ()>(()),
+    )
+    .unwrap()
+}
+
+#[test]
+fn recursive_data_uses_the_complete_family_carrier_in_every_self_field() {
+    let constant = |value| Expr::const_(name(value), Vec::new());
+    for (family, fields, carrier, expected) in [
+        (
+            "WriterList",
+            vec![
+                vec![],
+                vec![
+                    constant("Nat"),
+                    constant("WriterList"),
+                    constant("Bool"),
+                    constant("String"),
+                ],
+            ],
+            IrType::TObject,
+            vec![
+                vec![],
+                vec![
+                    IrType::TObject,
+                    IrType::TObject,
+                    IrType::UInt8,
+                    IrType::Object,
+                ],
+            ],
+        ),
+        (
+            "WriterTree",
+            vec![
+                vec![constant("Nat"), constant("Bool")],
+                vec![
+                    constant("WriterTree"),
+                    constant("Bool"),
+                    constant("WriterTree"),
+                ],
+            ],
+            IrType::Object,
+            vec![
+                vec![IrType::TObject, IrType::UInt8],
+                vec![IrType::Object, IrType::UInt8, IrType::Object],
+            ],
+        ),
+        (
+            "WriterLateStop",
+            vec![vec![constant("WriterLateStop"), constant("Bool")], vec![]],
+            IrType::TObject,
+            vec![vec![IrType::TObject, IrType::UInt8], vec![]],
+        ),
+        (
+            "WriterOnlySelf",
+            vec![vec![constant("WriterOnlySelf")]],
+            IrType::Object,
+            vec![vec![IrType::Object]],
+        ),
+    ] {
+        let (inductive, constructors) = closed_family(family, true, fields);
+        let projected = project_closed(&inductive, &constructors).unwrap();
+        assert!(projected.is_recursive(), "{family}");
+        assert!(projected.unboxed_field().is_none(), "{family}");
+        assert_eq!(projected.carrier(), &carrier, "{family}");
+        assert_eq!(
+            projected
+                .constructors()
+                .map(|(_, fields)| fields.to_vec())
+                .collect::<Vec<_>>(),
+            expected,
+            "{family}",
+        );
+        // Even the one-constructor, one-self-field family is recursive and
+        // cannot acquire the primitive wrapper's reduced constructor result.
+        for constructor in &projected.constructors {
+            let mut result = &constructor.mono_type;
+            while let ExprNode::ForallE { body, .. } = result.node() {
+                result = body;
+            }
+            assert_eq!(result, &constant(family), "{family}");
+        }
+        // This also walks and encodes the recursive mono types: the projection
+        // must not need a recursive object graph or an already compiled cache.
+        encode(
+            &SourceMetadata {
+                compiler_data: vec![projected],
+                ..SourceMetadata::default()
+            },
+            WriteBudget::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            CompilerData::from_inductive(
+                &inductive,
+                |name| constructors.iter().find(|ctor| ctor.name() == name),
+                |_| Err("work limit"),
+            )
+            .unwrap_err(),
+            "work limit",
+        );
+    }
+}
+
+#[test]
+fn recursive_projection_rejects_special_and_nonuniform_representations() {
+    let constant = |value| Expr::const_(name(value), Vec::new());
+    for family in ["Nat", "Int", "Lean.Name"] {
+        let (inductive, constructors) = closed_family(
+            family,
+            true,
+            vec![
+                vec![],
+                vec![constant(family), constant("Nat"), constant("String")],
+            ],
+        );
+        assert!(
+            project_closed(&inductive, &constructors).is_none(),
+            "{family}"
+        );
+    }
+    for (recursive, fields) in [
+        (false, vec![vec![], vec![constant("WriterInvalid")]]),
+        (true, vec![vec![], vec![constant("Nat")]]),
+        (
+            true,
+            vec![vec![Expr::forall_e(
+                name("n"),
+                constant("Nat"),
+                constant("WriterInvalid"),
+                BinderInfo::Default,
+            )]],
+        ),
+        (true, vec![vec![constant("UnrelatedFamily")]]),
+    ] {
+        let (inductive, constructors) = closed_family("WriterInvalid", recursive, fields);
+        assert!(project_closed(&inductive, &constructors).is_none());
+    }
+    // Recursion does not bypass any of the established closed-family bounds.
+    let (inductive, constructors) = closed_family(
+        "WriterBounded",
+        true,
+        vec![vec![], vec![constant("WriterBounded")]],
+    );
+    for unsupported in [
+        InductiveVal {
+            num_indices: 1,
+            ..inductive.clone()
+        },
+        InductiveVal {
+            num_params: 1,
+            ..inductive.clone()
+        },
+        InductiveVal {
+            num_nested: 1,
+            ..inductive.clone()
+        },
+        InductiveVal {
+            all: vec![name("WriterBounded"), name("Other")],
+            ..inductive.clone()
+        },
+    ] {
+        assert!(project_closed(&unsupported, &constructors).is_none());
+    }
 }
 
 #[test]
@@ -174,14 +430,33 @@ fn compiler_data_rejects_allocator_overflow_even_without_constructor_code() {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+enum FieldValue {
+    Object {
+        index: usize,
+        ty: Expr,
+    },
+    Scalar {
+        size: usize,
+        offset: usize,
+        ty: Expr,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
 enum MapValue {
     Nontrivial,
+    Trivial {
+        constructor: Name,
+        parameters: usize,
+        field: usize,
+    },
     Type(Expr),
     Constructor {
         name: Name,
         index: usize,
         size: usize,
-        fields: Vec<(usize, Expr)>,
+        scalar_bytes: usize,
+        fields: Vec<FieldValue>,
     },
 }
 
@@ -220,9 +495,32 @@ fn maps(blocks: &[OpaqueExtensionBlock], keep: &BTreeSet<Name>) -> Vec<BTreeMap<
                 let value = entry.ctor_child(1);
                 let value = match index {
                     0 | 1 => {
-                        assert!(value.is_scalar());
-                        assert_eq!(value.unbox(), 0, "present map entry with Option.none");
-                        MapValue::Nontrivial
+                        if value.is_scalar() {
+                            assert_eq!(value.unbox(), layout::OPTION_NONE);
+                            MapValue::Nontrivial
+                        } else {
+                            assert_eq!(value.obj_tag(), usize::from(layout::OPTION_SOME));
+                            assert_eq!(value.header().other as usize, layout::OPTION_SOME_POINTERS);
+                            let info = value.ctor_child(layout::OPTION_SOME_VAL);
+                            assert_eq!(info.obj_tag(), 0);
+                            assert_eq!(
+                                info.header().other as usize,
+                                ir::LCNF_TRIVIAL_STRUCTURE_INFO_POINTERS
+                            );
+                            MapValue::Trivial {
+                                constructor: conversion
+                                    .project_name(
+                                        &info.ctor_child(ir::LCNF_TRIVIAL_STRUCTURE_INFO_CTOR_NAME),
+                                    )
+                                    .unwrap(),
+                                parameters: info
+                                    .ctor_child(ir::LCNF_TRIVIAL_STRUCTURE_INFO_NUM_PARAMS)
+                                    .unbox(),
+                                field: info
+                                    .ctor_child(ir::LCNF_TRIVIAL_STRUCTURE_INFO_FIELD_IDX)
+                                    .unbox(),
+                            }
+                        }
                     }
                     2 | 3 => MapValue::Type(expression(&mut conversion, &mut heap, &value)),
                     4 => {
@@ -233,23 +531,55 @@ fn maps(blocks: &[OpaqueExtensionBlock], keep: &BTreeSet<Name>) -> Vec<BTreeMap<
                         assert_eq!(info.header().other, 5);
                         let ctor_name = conversion.project_name(&info.ctor_child(0)).unwrap();
                         assert_eq!(info.ctor_child(3).unbox(), 0, "no usize fields");
-                        assert_eq!(info.ctor_child(4).unbox(), 0, "no packed scalar bytes");
                         let array = value.ctor_child(1);
                         let fields = (0..array.array_view().0)
                             .map(|index| {
                                 let field = array.array_child(index);
-                                assert_eq!(field.obj_tag(), 1, "CtorFieldInfo.object");
-                                assert_eq!(field.header().other, 2);
-                                (
-                                    field.ctor_child(0).unbox(),
-                                    expression(&mut conversion, &mut heap, &field.ctor_child(1)),
-                                )
+                                match field.obj_tag() {
+                                    tag if tag == usize::from(ir::LCNF_CTOR_FIELD_OBJECT) => {
+                                        assert_eq!(
+                                            field.header().other as usize,
+                                            ir::LCNF_CTOR_FIELD_OBJECT_POINTERS
+                                        );
+                                        FieldValue::Object {
+                                            index: field
+                                                .ctor_child(ir::LCNF_CTOR_FIELD_OBJECT_I)
+                                                .unbox(),
+                                            ty: expression(
+                                                &mut conversion,
+                                                &mut heap,
+                                                &field.ctor_child(ir::LCNF_CTOR_FIELD_OBJECT_TYPE),
+                                            ),
+                                        }
+                                    }
+                                    tag if tag == usize::from(ir::LCNF_CTOR_FIELD_SCALAR) => {
+                                        assert_eq!(
+                                            field.header().other as usize,
+                                            ir::LCNF_CTOR_FIELD_SCALAR_POINTERS
+                                        );
+                                        FieldValue::Scalar {
+                                            size: field
+                                                .ctor_child(ir::LCNF_CTOR_FIELD_SCALAR_SZ)
+                                                .unbox(),
+                                            offset: field
+                                                .ctor_child(ir::LCNF_CTOR_FIELD_SCALAR_OFFSET)
+                                                .unbox(),
+                                            ty: expression(
+                                                &mut conversion,
+                                                &mut heap,
+                                                &field.ctor_child(ir::LCNF_CTOR_FIELD_SCALAR_TYPE),
+                                            ),
+                                        }
+                                    }
+                                    tag => panic!("unexpected compiler data field {tag}"),
+                                }
                             })
                             .collect();
                         MapValue::Constructor {
                             name: ctor_name,
                             index: info.ctor_child(1).unbox(),
                             size: info.ctor_child(2).unbox(),
+                            scalar_bytes: info.ctor_child(4).unbox(),
                             fields,
                         }
                     }
@@ -266,6 +596,7 @@ fn native_module(
     constants: &[ConstantInfo],
     imports: &[crate::region::ModuleImport],
     data: &[CompilerData],
+    aux_recursors: &[Name],
 ) -> Vec<u8> {
     let header = OleanWriteHeader {
         version: 2,
@@ -275,7 +606,18 @@ fn native_module(
         base_addr: 2 * format::REGION_ALIGN as u64,
     };
     let mut encoder = Encoder::new(WriteBudget::default(), header.version).unwrap();
-    let blocks = encoder.compiler_data_blocks(data).unwrap();
+    // The five compiler data maps are rebuilt below. Retain the independent
+    // auxiliary-recursor tags of these logical declarations: the pin recognizes
+    // an imported `.casesOn` by its tag as well as its name. Without the tag it
+    // incorrectly reaches ordinary-call lowering in this stripped fixture and
+    // asks for an executable signature that primitive cases do not need.
+    let blocks = encoder
+        .source_blocks(&SourceMetadata {
+            compiler_data: data.to_vec(),
+            aux_recursors: aux_recursors.to_vec(),
+            ..SourceMetadata::default()
+        })
+        .unwrap();
     let entries = encoder.array(blocks).unwrap();
     let root = encoder
         .module_root_with_entries(
@@ -305,6 +647,7 @@ fn assert_live_readers(
     constants: &[ConstantInfo],
     imports: &[crate::region::ModuleImport],
     data: &[CompilerData],
+    aux_recursors: &[Name],
 ) {
     // These are the actual strict pin readers, not a second Rust decoder.
     // No cached state is shared between invocations. The fixture's logical
@@ -314,22 +657,104 @@ fn assert_live_readers(
 import WriterData
 open Lean Elab Command Compiler LCNF
 run_cmd liftCoreM do
-  for n in [``WriterEnum, ``WriterSingleton, ``WriterMixed, ``WriterRecord, ``WriterHeap, ``WriterBinders] do
-    unless (← hasTrivialStructure? n).isNone do throwError "wrong mono trivial cache"
-    unless (← hasTrivialImpureStructure? n).isNone do throwError "wrong impure trivial cache"
+  for n in [``WriterEnum, ``WriterSingleton, ``WriterMixed, ``WriterRecord, ``WriterHeap, ``WriterBinders,
+      ``WriterScalar, ``WriterInterleaved, ``WriterAllBools, ``WriterScalarSum, ``WriterScalarHeap,
+      ``WriterRecursive, ``WriterRecursiveHeap, ``WriterRecursiveFirst, ``WriterRecursiveOnly,
+      ``WriterWrapper, ``WriterStringWrapper, ``WriterBoolWrapper] do
+    let wrapper := n == ``WriterWrapper || n == ``WriterStringWrapper || n == ``WriterBoolWrapper
+    for info? in [(← hasTrivialStructure? n), (← hasTrivialImpureStructure? n)] do
+      match info? with
+      | none => if wrapper then throwError "missing trivial wrapper cache"
+      | some info =>
+        unless wrapper && info.ctorName == Name.str n "mk" && info.numParams == 0 && info.fieldIdx == 0 do
+          throwError "wrong trivial wrapper cache"
     unless (← getOtherDeclMonoType n) == mkConst `lcErased do throwError "wrong mono type"
     let ty ← nameToImpureType n
     let expected := if n == ``WriterEnum then `UInt8
       else if n == ``WriterSingleton then `tagged
-      else if n == ``WriterMixed || n == ``WriterBinders then `tobj else `obj
+      else if n == ``WriterMixed || n == ``WriterBinders || n == ``WriterScalarSum ||
+          n == ``WriterRecursive || n == ``WriterRecursiveFirst then `tobj else `obj
     unless ty == mkConst expected do throwError "wrong impure carrier"
+    let publicExpected := if n == ``WriterWrapper then `tobj
+      else if n == ``WriterStringWrapper then `obj
+      else if n == ``WriterBoolWrapper then `UInt8 else expected
+    unless (← toImpureType (mkConst n)) == mkConst publicExpected do
+      throwError "wrong public wrapper carrier"
     let .inductInfo iv ← getConstInfo n | throwError "missing type"
     for c in iv.ctors do
-      let _ ← getOtherDeclMonoType c
+      let mono ← getOtherDeclMonoType c
+      if wrapper then
+        let fieldType := mkConst <| if n == ``WriterWrapper then `Nat
+          else if n == ``WriterStringWrapper then `String else `Bool
+        let .forallE _ domain result _ := mono | throwError "wrong wrapper constructor mono type"
+        unless domain == fieldType && result == fieldType do throwError "unreduced wrapper mono result"
       let layout ← getCtorLayout c
       unless layout.ctorInfo.name == c do throwError "wrong constructor owner"
-      unless layout.ctorInfo.size == layout.fieldInfo.size do throwError "wrong field count"
+      let mut objects := 0
+      let mut scalarBytes := 0
+      for field in layout.fieldInfo do
+        match field with
+        | .object i _ =>
+          unless i == objects do throwError "wrong object index"
+          objects := objects + 1
+        | .scalar size offset ty =>
+          unless size == 1 && offset == scalarBytes && ty == mkConst `UInt8 do
+            throwError "wrong packed Bool layout"
+          scalarBytes := scalarBytes + size
+        | _ => throwError "unexpected field representation"
+      unless layout.ctorInfo.size == objects && layout.ctorInfo.usize == 0
+          && layout.ctorInfo.ssize == scalarBytes do throwError "wrong field count"
   logInfo "native-data-caches-ok"
+"#;
+    let consumer = r#"import WriterData
+@[noinline] def unwrapWriterNat (value : WriterWrapper) : Nat :=
+  match value with | .mk n => n
+@[noinline] def unwrapWriterString (value : WriterStringWrapper) : String :=
+  match value with | .mk s => s
+@[noinline] def unwrapWriterBool (value : WriterBoolWrapper) : Bool :=
+  match value with | .mk b => b
+
+@[noinline] def recursiveDepth : WriterRecursive → Nat
+  | .stop => 0
+  | .next tail => recursiveDepth tail + 1
+
+@[noinline] def recursiveTail (value : WriterRecursive) : WriterRecursive :=
+  match value with
+  | .stop => .stop
+  | .next tail => tail
+
+@[noinline] def heapSummary : WriterRecursiveHeap → Nat × Nat
+  | .leaf n s => (n, s.length)
+  | .node left flag right =>
+    let left := heapSummary left
+    let right := heapSummary right
+    (left.1 + right.1 + (if flag then 1 else 0), left.2 + right.2)
+
+@[noinline] def heapFlagAfter (f : WriterRecursiveHeap → WriterRecursiveHeap)
+    (value : WriterRecursiveHeap) : Bool :=
+  match f value with
+  | .leaf _ _ => false
+  | .node _ flag _ => flag
+
+@[noinline] def firstDepth : WriterRecursiveFirst → Nat
+  | .next tail _ _ => firstDepth tail + 1
+  | .stop => 0
+
+@[noinline] def firstPayload (value : WriterRecursiveFirst) : Nat :=
+  match value with
+  | .next _ flag n => if flag then n else 0
+  | .stop => 0
+
+#eval (unwrapWriterNat (.mk 37), unwrapWriterString (.mk "native wrapper"), unwrapWriterBool (.mk true))
+#eval
+  let list := WriterRecursive.next (.next .stop)
+  let leaf := WriterRecursiveHeap.leaf 18446744073709551616 "shared"
+  let tree := WriterRecursiveHeap.node leaf true (.node leaf false leaf)
+  let first := WriterRecursiveFirst.next .stop true 18446744073709551616
+  let second := WriterRecursiveFirst.next first false 7
+  ((recursiveDepth list, recursiveDepth (recursiveTail list), recursiveDepth .stop),
+    (heapSummary tree, heapFlagAfter (fun t => .node t true t) leaf, heapSummary leaf),
+    (firstDepth .stop, firstDepth second, firstPayload first, firstPayload second))
 "#;
     std::fs::write(directory.join("Reader.lean"), reader).unwrap();
     let run = |bytes: Vec<u8>| {
@@ -337,18 +762,43 @@ run_cmd liftCoreM do
         Command::new(lean)
             .current_dir(directory)
             .env("LEAN_PATH", directory)
-            .arg("Reader.lean")
+            .args(["-j", "1", "Reader.lean"])
             .output()
             .unwrap()
     };
-    let positive = run(native_module(constants, imports, data));
+    let positive = run(native_module(constants, imports, data, aux_recursors));
     assert!(
         positive.status.success(),
         "native compiler-cache reader: {}\n{}",
         String::from_utf8_lossy(&positive.stdout),
         String::from_utf8_lossy(&positive.stderr)
     );
-    assert!(String::from_utf8_lossy(&positive.stdout).contains("native-data-caches-ok"));
+    assert_eq!(
+        String::from_utf8_lossy(&positive.stdout).trim(),
+        "native-data-caches-ok"
+    );
+    // Compile ordinary downstream code in its own process and import context.
+    // The producer supplies logical declarations and native metadata only;
+    // the pin compiles this consumer, including its recursive function bodies.
+    assert!(!directory.join("WriterData.ir").exists());
+    std::fs::write(directory.join("Consumer.lean"), consumer).unwrap();
+    let consumed = Command::new(lean)
+        .current_dir(directory)
+        .env("LEAN_PATH", directory)
+        .args(["-j", "1", "Consumer.lean"])
+        .output()
+        .unwrap();
+    assert!(
+        consumed.status.success(),
+        "native compiler-data consumer: {}\n{}",
+        String::from_utf8_lossy(&consumed.stdout),
+        String::from_utf8_lossy(&consumed.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&consumed.stdout).trim(),
+        "(37, \"native wrapper\", true)\n((2, 1, 0), ((55340232221128654849, 18), true, 18446744073709551616, 6), 0, 2, 18446744073709551616, 0)",
+        "fresh pin consumer must construct, fold and project the native wrapper and recursive layouts"
+    );
     // Rebuild a coherent graph without WriterMixed's cache rows. Do not build
     // then discard encoded objects: the writer's complete region audit must
     // still account for every allocation in these counterfactual artifacts.
@@ -357,7 +807,7 @@ run_cmd liftCoreM do
         .filter(|row| row.name != name("WriterMixed"))
         .cloned()
         .collect();
-    let missing_bytes = native_module(constants, imports, &absent);
+    let missing_bytes = native_module(constants, imports, &absent, aux_recursors);
     for (index, query) in [
         "hasTrivialStructure? ``WriterMixed",
         "hasTrivialImpureStructure? ``WriterMixed",
@@ -390,7 +840,7 @@ run_cmd liftCoreM do
         .unwrap()
         .carrier = IrType::UInt8;
     std::fs::write(directory.join("Reader.lean"), reader).unwrap();
-    let altered = run(native_module(constants, imports, &altered));
+    let altered = run(native_module(constants, imports, &altered, aux_recursors));
     assert!(!altered.status.success());
     assert!(
         String::from_utf8_lossy(&altered.stdout).contains("wrong impure carrier"),
@@ -418,6 +868,18 @@ fn compiler_data_maps_match_the_actual_pin_and_refuse_unsupported_layouts() {
         "WriterRecord",
         "WriterHeap",
         "WriterBinders",
+        "WriterScalar",
+        "WriterInterleaved",
+        "WriterAllBools",
+        "WriterScalarSum",
+        "WriterScalarHeap",
+        "WriterRecursive",
+        "WriterRecursiveHeap",
+        "WriterRecursiveFirst",
+        "WriterRecursiveOnly",
+        "WriterWrapper",
+        "WriterStringWrapper",
+        "WriterBoolWrapper",
     ]
     .into_iter()
     .map(name)
@@ -448,7 +910,30 @@ fn compiler_data_maps_match_the_actual_pin_and_refuse_unsupported_layouts() {
         !module.is_module,
         "this wire fixture is a standalone logical module"
     );
-    assert_live_readers(&lean, &directory, &constants, &module.imports, &data);
+    let auxiliary_tags = actual
+        .iter()
+        .find(|block| block.name == name(layout::AUX_RECURSOR_EXTENSION))
+        .unwrap();
+    let source_metadata = crate::source_extensions::decode(
+        std::slice::from_ref(auxiliary_tags),
+        crate::source_extensions::DecodeLimits::default(),
+    )
+    .unwrap();
+    for wrapper in ["WriterWrapper", "WriterStringWrapper", "WriterBoolWrapper"] {
+        assert!(
+            source_metadata
+                .aux_recursors
+                .contains(&Name::str(name(wrapper), "casesOn"))
+        );
+    }
+    assert_live_readers(
+        &lean,
+        &directory,
+        &constants,
+        &module.imports,
+        &data,
+        &source_metadata.aux_recursors,
+    );
     let ConstantInfo::Induct(inductive) = constants
         .iter()
         .find(|constant| constant.name() == &name("WriterMixed"))

@@ -3,7 +3,7 @@
 
 use fln_comp::{fir, flbc};
 use fln_core::outcome::Outcome;
-use fln_vm::interpreter::{ExecutionLimits, VmExit, execute, nat_decimal};
+use fln_vm::interpreter::{ExecutionLimits, VmExit, VmRefusal, execute, nat_decimal};
 
 fn r(index: u16) -> flbc::Register {
     flbc::Register::new(index)
@@ -45,6 +45,150 @@ fn returned(program: &flbc::ValidatedProgram) -> fln_rt::obj::Obj {
         panic!("{outcome:?}")
     };
     result.value
+}
+
+const BOOL_CONVERSIONS: &[(&str, bool)] = &[
+    ("extern:Bool.toUInt8", false),
+    ("extern:Bool.toUInt16", false),
+    ("extern:Bool.toUInt32", false),
+    ("extern:Bool.toUInt64", true),
+    ("extern:Bool.toUSize", true),
+    ("extern:Bool.toInt8", false),
+    ("extern:Bool.toInt16", false),
+    ("extern:Bool.toInt32", false),
+    ("extern:Bool.toInt64", true),
+    ("extern:Bool.toISize", true),
+];
+
+fn scalar_intrinsic(dst: u16, row: &str, args: &[u16]) -> flbc::Instruction {
+    flbc::Instruction::Intrinsic {
+        dst: r(dst),
+        row: row.to_owned(),
+        args: args.iter().copied().map(r).collect(),
+        argument_ownership: vec![flbc::ArgumentOwnership::Scalar; args.len()],
+        result_ownership: flbc::ResultOwnership::Scalar,
+    }
+}
+
+#[test]
+fn boolean_conversions_preserve_values_and_destination_scalar_carriers() {
+    use flbc::Instruction as I;
+    for value in [0, 1] {
+        let mut code = vec![I::Nat { dst: r(0), value }];
+        for (index, (row, _)) in BOOL_CONVERSIONS.iter().copied().enumerate() {
+            code.push(scalar_intrinsic(
+                u16::try_from(index + 1).unwrap(),
+                row,
+                &[0],
+            ));
+        }
+        let output = u16::try_from(BOOL_CONVERSIONS.len() + 1).unwrap();
+        code.push(I::Array {
+            dst: r(output),
+            items: (1..output).map(r).collect(),
+        });
+        code.push(I::Return { src: r(output) });
+        for replay in replays(program(code, output + 1, true)) {
+            let result = returned(&replay);
+            for (index, (row, wide)) in BOOL_CONVERSIONS.iter().copied().enumerate() {
+                let converted = result.array_child(index);
+                assert_eq!(converted.is_scalar(), !wide, "{row}");
+                if wide {
+                    assert_eq!(converted.try_ctor_scalar_u64(0), Some(value), "{row}");
+                } else {
+                    assert_eq!(converted.unbox() as u64, value, "{row}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn strict_boolean_intrinsics_execute_complete_truth_tables() {
+    use flbc::Instruction as I;
+    for row in ["extern:strictAnd", "extern:strictOr"] {
+        for (left, right, and, or) in [
+            (0, 0, "0", "0"),
+            (0, 1, "0", "1"),
+            (1, 0, "0", "1"),
+            (1, 1, "1", "1"),
+        ] {
+            let expected = if row == "extern:strictAnd" { and } else { or };
+            let source = program(
+                vec![
+                    I::Nat {
+                        dst: r(0),
+                        value: left,
+                    },
+                    I::Nat {
+                        dst: r(1),
+                        value: right,
+                    },
+                    scalar_intrinsic(2, row, &[0, 1]),
+                    I::Return { src: r(2) },
+                ],
+                3,
+                false,
+            );
+            for replay in replays(source) {
+                assert_eq!(
+                    nat_decimal(&returned(&replay)).as_deref(),
+                    Some(expected),
+                    "{row} {left} {right}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn boolean_intrinsics_refuse_invalid_tags_without_short_circuiting() {
+    use flbc::Instruction as I;
+    let mut cases: Vec<_> = BOOL_CONVERSIONS
+        .iter()
+        .map(|(row, _)| (*row, vec![2], 0))
+        .collect();
+    cases.extend([
+        ("extern:strictAnd", vec![0, 2], 1),
+        ("extern:strictOr", vec![1, 2], 1),
+        ("extern:strictAnd", vec![2, 0], 0),
+        ("extern:strictOr", vec![2, 1], 0),
+    ]);
+    for (row, values, argument) in cases {
+        let mut code: Vec<_> = values
+            .iter()
+            .enumerate()
+            .map(|(index, &value)| I::Nat {
+                dst: r(u16::try_from(index).unwrap()),
+                value,
+            })
+            .collect();
+        let output = u16::try_from(values.len()).unwrap();
+        code.push(scalar_intrinsic(
+            output,
+            row,
+            &(0..output).collect::<Vec<_>>(),
+        ));
+        code.push(I::Return { src: r(output) });
+        for replay in replays(program(code, output + 1, false)) {
+            let outcome = execute(&replay, ExecutionLimits::default(), None);
+            assert!(
+                matches!(
+                    outcome,
+                    Outcome::Complete(VmExit::Refused {
+                        refusal: VmRefusal::InvalidBoolScalar {
+                            operation,
+                            argument: actual_argument,
+                            value: 2,
+                        },
+                        ..
+                    }) if operation == row.strip_prefix("extern:").unwrap()
+                        && actual_argument == argument
+                ),
+                "{row}: {outcome:?}"
+            );
+        }
+    }
 }
 
 #[test]

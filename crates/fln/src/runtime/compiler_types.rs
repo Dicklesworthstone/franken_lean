@@ -138,6 +138,26 @@ pub(crate) fn check(
 }
 
 impl Preparation<'_> {
+    /// Whether an already admitted declaration has no computational result at
+    /// the pin's `shouldGenerateCode` boundary. Use a fresh type-only query so
+    /// compiler transparency cannot change an executable preparation's caches.
+    /// The returned work is charged to the caller's compilation budget even
+    /// when the declaration needs no executable entry.
+    pub(crate) fn computationally_irrelevant_header(
+        environment: &Environment,
+        type_: &Expr,
+        limits: IngressLimits,
+    ) -> Result<(bool, usize), IngressError> {
+        let mut preparation = Preparation::new(environment, limits);
+        preparation.compiler_signature_type_aliases = true;
+        let irrelevant = preparation.compiler_irrelevant_type(type_)?;
+        Ok((irrelevant, preparation.visited))
+    }
+
+    fn compiler_irrelevant_type(&mut self, type_: &Expr) -> Result<bool, IngressError> {
+        Ok(self.type_parameter(type_)? || self.proposition_type(type_, &[])?)
+    }
+
     fn uncompiled_structure_helpers(
         &mut self,
         admission: &DeclarationBatchAdmission,
@@ -240,10 +260,7 @@ impl Preparation<'_> {
         // shouldGenerateCode does not compile proofs/type formers. The
         // original telescope is retained so local proposition carriers are
         // classified by their checked types, rather than identifier spelling.
-        if self.is_noncomputable_name(&base.name)?
-            || self.type_parameter(&base.type_)?
-            || self.proposition_type(&base.type_, &[])?
-        {
+        if self.is_noncomputable_name(&base.name)? || self.compiler_irrelevant_type(&base.type_)? {
             return Ok(None);
         }
         let external = self.has_extern_attribute(&base.name)?;

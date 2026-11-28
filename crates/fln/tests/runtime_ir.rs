@@ -184,8 +184,14 @@ const BOXED_DATA_HELPERS: &str = concat!(
     "structure IRNatWrapper where\n value : Nat\n",
     "structure IRStringWrapper where\n value : String\n",
     "structure IRScalarBox where\n number : Nat\n flag : Bool\n",
+    "structure IRInterleaved where\n first : Bool\n number : Nat\n second : Bool\n text : String\n",
+    "structure IRScalarReordered where\n number : Nat\n first : Bool\n text : String\n second : Bool\n",
+    "structure IRAllBools where\n first : Bool\n second : Bool\n third : Bool\n",
     "structure IRProofBox where\n number : Nat\n proof : True\n",
     "inductive IRRecursive where\n | empty\n | next (n : Nat) (tail : IRRecursive)\n",
+    "inductive IRRecursiveFirst where\n | next (n : Nat) (tail : IRRecursiveFirst)\n | empty\n",
+    "inductive IRRecursiveTree where\n | leaf (n : Nat) (text : String)\n | node (left : IRRecursiveTree) (flag : Bool) (right : IRRecursiveTree)\n",
+    "inductive IRRecursiveLoop where\n | next (tail : IRRecursiveLoop)\n",
     "inductive IRBoxedParam (A : Type) where\n | mk (value : A) (n : Nat)\n",
     "abbrev IRBoxedAlias := IRBoxedRecord\n",
 );
@@ -393,6 +399,422 @@ fn boxed_export_cases() -> Vec<BoxedExportCase> {
             parameters: vec![IrType::Object],
             result: IrType::Object,
             reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRScalarBox",
+            body: "IRScalarBox.mk 42 true",
+            application: "(compiled.number, compiled.flag)",
+            expected: "(42, true)",
+            parameters: vec![],
+            result: IrType::Object,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRScalarBox -> IRScalarBox",
+            body: "fun p => p",
+            application: "let p := IRScalarBox.mk large true; let q := compiled p; (q.number, q.flag, p.number, p.flag)",
+            expected: "(184467440737095516160, true, 184467440737095516160, true)",
+            parameters: vec![IrType::Object],
+            result: IrType::Object,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "Nat -> Bool -> IRScalarBox",
+            body: "fun n b => IRScalarBox.mk n b",
+            application: "let p := compiled large false; let q := compiled large true; (p.number, p.flag, q.number, q.flag)",
+            expected: "(184467440737095516160, false, 184467440737095516160, true)",
+            parameters: vec![IrType::TObject, IrType::UInt8],
+            result: IrType::Object,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRScalarBox -> Bool",
+            body: "fun p => p.flag",
+            application: "(compiled (IRScalarBox.mk large false), compiled (IRScalarBox.mk large true))",
+            expected: "(false, true)",
+            parameters: vec![IrType::Object],
+            result: IrType::UInt8,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRInterleaved -> IRInterleaved",
+            body: "fun p => IRInterleaved.mk p.second p.number p.first p.text",
+            application: "let p := IRInterleaved.mk true large false heap; let q := compiled p; (q.first, q.second, q.number, q.text, p.number, p.text)",
+            expected: "(false, true, 184467440737095516160, \"boxed heap payload\", 184467440737095516160, \"boxed heap payload\")",
+            parameters: vec![IrType::Object],
+            result: IrType::Object,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "Bool -> Bool -> Bool -> IRAllBools",
+            body: "fun a b c => IRAllBools.mk a b c",
+            application: "let p := compiled true false true; let q := compiled false true false; (p.first, p.second, p.third, q.first, q.second, q.third)",
+            expected: "(true, false, true, false, true, false)",
+            parameters: vec![IrType::UInt8, IrType::UInt8, IrType::UInt8],
+            result: IrType::Object,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRAllBools -> Bool",
+            body: "fun p => if p.first then p.third else p.second",
+            application: "(compiled (IRAllBools.mk true false true), compiled (IRAllBools.mk true true false), compiled (IRAllBools.mk false true false))",
+            expected: "(true, false, true)",
+            parameters: vec![IrType::Object],
+            result: IrType::UInt8,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "Bool -> IRScalarPayload",
+            body: "fun b => IRScalarPayload.value b",
+            application: "((match compiled false with | .empty => true | .value b => b), (match compiled true with | .empty => false | .value b => b))",
+            expected: "(false, true)",
+            parameters: vec![IrType::UInt8],
+            result: IrType::TObject,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRScalarPayload -> IRScalarPayload",
+            body: "fun p => p",
+            application: "((match compiled .empty with | .empty => true | _ => false), (match compiled (.value false) with | .empty => true | .value b => b), (match compiled (.value true) with | .empty => false | .value b => b))",
+            expected: "(true, false, true)",
+            parameters: vec![IrType::TObject],
+            result: IrType::TObject,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRScalarPayload -> Bool",
+            body: "fun p => match p with | .empty => false | .value b => b",
+            application: "(compiled .empty, compiled (.value false), compiled (.value true))",
+            expected: "(false, false, true)",
+            parameters: vec![IrType::TObject],
+            result: IrType::UInt8,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "(IRInterleaved -> IRInterleaved) -> IRInterleaved -> IRInterleaved",
+            body: "fun f p => f p",
+            application: "let p := IRInterleaved.mk true large false heap; let q := compiled (fun x => IRInterleaved.mk x.second (x.number + 1) x.first (x.text ++ \"!\")) p; (q.first, q.second, q.number, q.text, p.number, p.text)",
+            expected: "(false, true, 184467440737095516161, \"boxed heap payload!\", 184467440737095516160, \"boxed heap payload\")",
+            parameters: vec![IrType::Object, IrType::Object],
+            result: IrType::Object,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "(IRScalarBox -> Bool) -> Nat -> Bool",
+            body: "fun f n => f (IRScalarBox.mk n true)",
+            application: "compiled (fun p => p.flag && p.number == large) large",
+            expected: "true",
+            parameters: vec![IrType::Object, IrType::TObject],
+            result: IrType::UInt8,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "(IRScalarPayload -> Nat) -> Nat",
+            body: "fun f => f IRScalarPayload.empty",
+            application: "compiled (fun p => match p with | .empty => 42 | .value b => if b then 1 else 0)",
+            expected: "42",
+            parameters: vec![IrType::Object],
+            result: IrType::TObject,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRInterleaved -> Nat -> Nat",
+            body: "fun _ n => n",
+            application: "compiled (IRInterleaved.mk true large false heap) 42",
+            expected: "42",
+            parameters: vec![IrType::Object, IrType::TObject],
+            result: IrType::TObject,
+            reduced: Some(("Nat -> Nat", "compiled 42")),
+        },
+        BoxedExportCase {
+            ty: "IRAllBools -> Bool -> Bool",
+            body: "fun _ b => b",
+            application: "compiled (IRAllBools.mk true false true) true",
+            expected: "true",
+            parameters: vec![IrType::Object, IrType::UInt8],
+            result: IrType::UInt8,
+            reduced: Some(("Bool -> Bool", "compiled true")),
+        },
+        BoxedExportCase {
+            ty: "IRNatWrapper",
+            body: "IRNatWrapper.mk 42",
+            application: "compiled.value",
+            expected: "42",
+            parameters: vec![],
+            result: IrType::TObject,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "Nat -> IRNatWrapper",
+            body: "fun n => IRNatWrapper.mk n",
+            application: "((compiled 42).value, (compiled large).value, large)",
+            expected: "(42, 184467440737095516160, 184467440737095516160)",
+            parameters: vec![IrType::TObject],
+            result: IrType::TObject,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRNatWrapper -> IRNatWrapper",
+            body: "fun p => p",
+            application: "let p := IRNatWrapper.mk large; let q := compiled p; ((compiled (IRNatWrapper.mk 42)).value, q.value, p.value)",
+            expected: "(42, 184467440737095516160, 184467440737095516160)",
+            parameters: vec![IrType::TObject],
+            result: IrType::TObject,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRNatWrapper -> Nat",
+            body: "fun p => match p with | .mk n => n",
+            application: "let p := IRNatWrapper.mk large; (compiled p, p.value)",
+            expected: "(184467440737095516160, 184467440737095516160)",
+            parameters: vec![IrType::TObject],
+            result: IrType::TObject,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "String -> IRStringWrapper",
+            body: "fun s => IRStringWrapper.mk s",
+            application: "let p := compiled heap; (p.value, heap)",
+            expected: "(\"boxed heap payload\", \"boxed heap payload\")",
+            parameters: vec![IrType::Object],
+            result: IrType::Object,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRStringWrapper -> IRStringWrapper",
+            body: "fun p => IRStringWrapper.mk (p.value ++ p.value)",
+            application: "let p := IRStringWrapper.mk heap; let q := compiled p; (q.value, p.value)",
+            expected: "(\"boxed heap payloadboxed heap payload\", \"boxed heap payload\")",
+            parameters: vec![IrType::Object],
+            result: IrType::Object,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRStringWrapper -> String",
+            body: "fun p => p.value",
+            application: "let p := IRStringWrapper.mk heap; (compiled p, p.value)",
+            expected: "(\"boxed heap payload\", \"boxed heap payload\")",
+            parameters: vec![IrType::Object],
+            result: IrType::Object,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "Bool -> IRBoolBox",
+            body: "fun b => IRBoolBox.mk b",
+            application: "((compiled false).value, (compiled true).value)",
+            expected: "(false, true)",
+            parameters: vec![IrType::UInt8],
+            result: IrType::UInt8,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRBoolBox -> Bool",
+            body: "fun p => p.value",
+            application: "(compiled (IRBoolBox.mk false), compiled (IRBoolBox.mk true))",
+            expected: "(false, true)",
+            parameters: vec![IrType::UInt8],
+            result: IrType::UInt8,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRBoolBox -> IRBoolBox",
+            body: "fun p => match p with | .mk b => IRBoolBox.mk b",
+            application: "((compiled (IRBoolBox.mk false)).value, (compiled (IRBoolBox.mk true)).value)",
+            expected: "(false, true)",
+            parameters: vec![IrType::UInt8],
+            result: IrType::UInt8,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "(IRNatWrapper -> IRNatWrapper) -> IRNatWrapper -> IRNatWrapper",
+            body: "fun f p => f p",
+            application: "let p := IRNatWrapper.mk large; let q := compiled (fun x => IRNatWrapper.mk (x.value + 1)) p; (q.value, p.value)",
+            expected: "(184467440737095516161, 184467440737095516160)",
+            parameters: vec![IrType::Object, IrType::TObject],
+            result: IrType::TObject,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "(IRBoolBox -> IRBoolBox) -> IRBoolBox -> IRBoolBox",
+            body: "fun f p => f p",
+            application: "let f := fun p : IRBoolBox => IRBoolBox.mk (if p.value then false else true); ((compiled f (IRBoolBox.mk false)).value, (compiled f (IRBoolBox.mk true)).value)",
+            expected: "(true, false)",
+            parameters: vec![IrType::Object, IrType::UInt8],
+            result: IrType::UInt8,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "(IRStringWrapper -> String) -> String -> String",
+            body: "fun f s => f (IRStringWrapper.mk s)",
+            application: "(compiled (fun p => p.value ++ \"!\") heap, heap)",
+            expected: "(\"boxed heap payload!\", \"boxed heap payload\")",
+            parameters: vec![IrType::Object, IrType::Object],
+            result: IrType::Object,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "((Nat -> IRStringWrapper) -> IRStringWrapper) -> String -> IRStringWrapper",
+            body: "fun use s => use (fun _ => IRStringWrapper.mk s)",
+            application: "let p := compiled (fun f => f 42) heap; (p.value, heap)",
+            expected: "(\"boxed heap payload\", \"boxed heap payload\")",
+            parameters: vec![IrType::Object, IrType::Object],
+            result: IrType::Object,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRNatWrapper -> IRStringWrapper -> IRStringWrapper",
+            body: "fun _ p => p",
+            application: "let p := IRStringWrapper.mk heap; let q := compiled (IRNatWrapper.mk large) p; (q.value, p.value)",
+            expected: "(\"boxed heap payload\", \"boxed heap payload\")",
+            parameters: vec![IrType::TObject, IrType::Object],
+            result: IrType::Object,
+            reduced: Some((
+                "IRStringWrapper -> IRStringWrapper",
+                "let p := IRStringWrapper.mk heap; let q := compiled p; (q.value, p.value)",
+            )),
+        },
+        BoxedExportCase {
+            ty: "IRStringWrapper -> Nat -> Nat",
+            body: "fun _ n => n",
+            application: "compiled (IRStringWrapper.mk heap) 42",
+            expected: "42",
+            parameters: vec![IrType::Object, IrType::TObject],
+            result: IrType::TObject,
+            reduced: Some(("Nat -> Nat", "compiled 42")),
+        },
+        BoxedExportCase {
+            ty: "IRBoolBox -> Nat -> Nat",
+            body: "fun _ n => n",
+            application: "compiled (IRBoolBox.mk true) 42",
+            expected: "42",
+            parameters: vec![IrType::UInt8, IrType::TObject],
+            result: IrType::TObject,
+            reduced: Some(("Nat -> Nat", "compiled 42")),
+        },
+    ]
+}
+
+fn recursive_export_cases() -> Vec<BoxedExportCase> {
+    vec![
+        BoxedExportCase {
+            ty: "IRRecursive",
+            body: "IRRecursive.next 7 (IRRecursive.next 9 IRRecursive.empty)",
+            application: "match compiled with | .next n (.next m _) => n + m | _ => 0",
+            expected: "16",
+            parameters: vec![],
+            result: IrType::TObject,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRRecursive -> IRRecursive",
+            body: "fun p => p",
+            application: "let p := IRRecursive.next large (.next 2 .empty); let q := compiled p; ((match q with | .next n (.next m _) => n + m | _ => 0), (match p with | .next n _ => n | _ => 0))",
+            expected: "(184467440737095516162, 184467440737095516160)",
+            parameters: vec![IrType::TObject],
+            result: IrType::TObject,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRRecursive -> IRRecursive",
+            body: "fun p => match p with | .empty => .empty | .next _ tail => tail",
+            application: "let p := IRRecursive.next large (.next 2 .empty); ((match compiled .empty with | .empty => 0 | _ => 1), (match compiled p with | .next n _ => n | _ => 0), (match p with | .next n _ => n | _ => 0))",
+            expected: "(0, 2, 184467440737095516160)",
+            parameters: vec![IrType::TObject],
+            result: IrType::TObject,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "(IRRecursive -> IRRecursive) -> IRRecursive -> IRRecursive",
+            body: "fun f p => f p",
+            application: "let p := IRRecursive.next large .empty; let q := compiled (fun tail => .next 3 tail) p; ((match q with | .next n (.next m _) => n + m | _ => 0), (match p with | .next n _ => n | _ => 0))",
+            expected: "(184467440737095516163, 184467440737095516160)",
+            parameters: vec![IrType::Object, IrType::TObject],
+            result: IrType::TObject,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "Nat -> IRRecursive -> IRRecursive",
+            body: "fun n tail => IRRecursive.next n tail",
+            application: "let tail := IRRecursive.next 2 .empty; let p := compiled large tail; ((match p with | .next n (.next m _) => n + m | _ => 0), (match tail with | .next n _ => n | _ => 0))",
+            expected: "(184467440737095516162, 2)",
+            parameters: vec![IrType::TObject, IrType::TObject],
+            result: IrType::TObject,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRRecursive -> Nat",
+            body: "fun p => let rec total (xs : IRRecursive) : Nat := match xs with | .empty => 0 | .next n tail => n + total tail; total p",
+            application: "let p := IRRecursive.next large (.next 2 (.next 3 .empty)); (compiled .empty, compiled p, (match p with | .next n _ => n | _ => 0))",
+            expected: "(0, 184467440737095516165, 184467440737095516160)",
+            parameters: vec![IrType::TObject],
+            result: IrType::TObject,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRRecursiveFirst -> IRRecursiveFirst",
+            body: "fun p => p",
+            application: "((match compiled .empty with | .empty => 7 | _ => 0), (match compiled (.next large .empty) with | .next n _ => n | _ => 0))",
+            expected: "(7, 184467440737095516160)",
+            parameters: vec![IrType::TObject],
+            result: IrType::TObject,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRRecursiveTree -> Bool -> IRRecursiveTree -> IRRecursiveTree",
+            body: "fun left flag right => IRRecursiveTree.node left flag right",
+            application: "let left := IRRecursiveTree.leaf large heap; let right := IRRecursiveTree.leaf 3 \"tail\"; match compiled left true right with | .node (.leaf n s) flag (.leaf m t) => (n + m, s, flag, t, (match left with | .leaf k _ => k | _ => 0)) | _ => (0, \"wrong\", false, \"wrong\", 0)",
+            expected: "(184467440737095516163, \"boxed heap payload\", true, \"tail\", 184467440737095516160)",
+            parameters: vec![IrType::Object, IrType::UInt8, IrType::Object],
+            result: IrType::Object,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRRecursiveTree -> Bool",
+            body: "fun p => match p with | .node left _ _ => (match left with | .node _ b _ => b | .leaf _ _ => false) | .leaf _ _ => false",
+            application: "let leaf := IRRecursiveTree.leaf large heap; let p := IRRecursiveTree.node (.node leaf true leaf) false leaf; (compiled p, (match p with | .node _ b _ => b | _ => true))",
+            expected: "(true, false)",
+            parameters: vec![IrType::Object],
+            result: IrType::UInt8,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "(IRRecursiveTree -> IRRecursiveTree) -> IRRecursiveTree -> Bool",
+            body: "fun f p => match f p with | .node _ b _ => b | .leaf _ _ => false",
+            application: "let p := IRRecursiveTree.leaf large heap; (compiled (fun t => .node t true t) p, (match p with | .leaf n s => (n, s) | _ => (0, \"wrong\")))",
+            expected: "(true, 184467440737095516160, \"boxed heap payload\")",
+            parameters: vec![IrType::Object, IrType::Object],
+            result: IrType::UInt8,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "Nat -> (IRRecursiveTree -> IRRecursiveTree) -> IRRecursiveTree -> Bool",
+            body: "fun _ f p => match f p with | .node _ b _ => b | .leaf _ _ => false",
+            application: "let p := IRRecursiveTree.leaf large heap; (compiled 99 (fun t => .node t true t) p, (match p with | .leaf n s => (n, s) | _ => (0, \"wrong\")))",
+            expected: "(true, 184467440737095516160, \"boxed heap payload\")",
+            parameters: vec![IrType::TObject, IrType::Object, IrType::Object],
+            result: IrType::UInt8,
+            reduced: Some((
+                "(IRRecursiveTree -> IRRecursiveTree) -> IRRecursiveTree -> Bool",
+                "let p := IRRecursiveTree.leaf large heap; (compiled (fun t => .node t true t) p, (match p with | .leaf n s => (n, s) | _ => (0, \"wrong\")))",
+            )),
+        },
+        BoxedExportCase {
+            ty: "Bool -> (IRRecursiveTree -> IRRecursiveTree) -> IRRecursiveTree -> Bool",
+            body: "fun fallback f p => match f p with | .node _ b _ => b | .leaf _ _ => fallback",
+            application: "let p := IRRecursiveTree.leaf large heap; (compiled true (fun t => t) p, compiled false (fun t => t) p, compiled false (fun t => .node t true t) p, (match p with | .leaf n s => (n, s) | _ => (0, \"wrong\")))",
+            expected: "(true, false, true, 184467440737095516160, \"boxed heap payload\")",
+            parameters: vec![IrType::UInt8, IrType::Object, IrType::Object],
+            result: IrType::UInt8,
+            reduced: None,
+        },
+        BoxedExportCase {
+            ty: "IRRecursive -> Nat -> Nat",
+            body: "fun _ n => n",
+            application: "compiled (IRRecursive.next large .empty) 42",
+            expected: "42",
+            parameters: vec![IrType::TObject, IrType::TObject],
+            result: IrType::TObject,
+            reduced: Some(("Nat -> Nat", "compiled 42")),
         },
     ]
 }
@@ -932,6 +1354,66 @@ fn checked_definition(base: &Engine, source: &str) -> (fln::Declaration, Engine)
     (fln::Declaration::Defn(definition.clone()), checked.engine)
 }
 
+fn assert_definition_admission(
+    base: &Engine,
+    checked: &Engine,
+    compiled: &ir::DefinitionCompilation,
+    options: &KVMap,
+) {
+    // Source checking also records equations and local-recursion auxiliaries.
+    // The IR API receives only the Declaration, so its receipt must equal an
+    // independent admission of that exact declaration. Keep the full source
+    // snapshot as the execution oracle; compare the complete independent and
+    // compiler admission environments in both directions.
+    let fln::Declaration::Defn(definition) = &compiled.admission.declaration else {
+        panic!("compiled source definition")
+    };
+    let Some(fln::ConstantInfo::Defn(source)) = checked.environment().find(&definition.base.name)
+    else {
+        panic!("source definition identity")
+    };
+    assert_eq!(
+        definition, source,
+        "compiler must admit the unchanged source body"
+    );
+    let original = base.logical_root(options);
+    let expected = base
+        .admit_declaration(
+            compiled.admission.declaration.clone(),
+            options,
+            EngineAdmissionLimits::new(limits().kernel),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let admitted = compiled.admission.engine.environment();
+    for (name, value) in expected.engine.environment().constants() {
+        assert_eq!(
+            admitted.find(name),
+            Some(value),
+            "independently admitted declaration {name:?}"
+        );
+    }
+    for (name, value) in admitted.constants() {
+        assert_eq!(
+            expected.engine.environment().find(name),
+            Some(value),
+            "unexpected compiler declaration {name:?}",
+        );
+    }
+    assert_eq!(compiled.admission.base_logical_root, original);
+    assert_eq!(compiled.admission.admissions.len(), 1);
+    assert_eq!(
+        compiled.admission.result_logical_root,
+        expected.result_logical_root
+    );
+    assert_eq!(
+        compiled.admission.engine.logical_root(options),
+        expected.engine.logical_root(options),
+    );
+    assert_eq!(base.logical_root(options), original);
+}
+
 #[test]
 fn arbitrary_fir_cannot_claim_the_closed_source_constructor_boundary() {
     use fln_comp::fir::*;
@@ -1048,10 +1530,7 @@ fn fieldless_enum_exports_preserve_scalar_signatures_and_private_layouts() {
         .unwrap_or_else(|error| panic!("{source}: {error:?}"))
         .into_complete()
         .unwrap();
-        assert_eq!(
-            compiled.admission.result_logical_root,
-            checked.logical_root(&options)
-        );
+        assert_definition_admission(&base, &checked, &compiled, &options);
         let IrDecl::Function { params, result, .. } = compiled
             .module
             .decls
@@ -1099,11 +1578,9 @@ fn fieldless_enum_exports_preserve_scalar_signatures_and_private_layouts() {
         assert_eq!(base.logical_root(&options), original);
     }
     for source in [
-        "def compiled (x : IRScalarPayload) : IRScalarPayload := x",
         "def compiled (x : IRParameterized Nat) : IRParameterized Nat := x",
         "def compiled (x : IRAlias) : IRAlias := x",
         "def compiled : True := True.intro",
-        "def compiled (f : IRScalarPayload -> Nat) : Nat := f IRScalarPayload.empty",
     ] {
         let (declaration, _) = checked_definition(&base, source);
         assert!(
@@ -1178,10 +1655,7 @@ partial def resetIRChoice (n : Nat) (value : IRChoice) : IRChoice :=
             [IrType::TObject]
         );
         assert_eq!(*result, IrType::UInt8);
-        assert_eq!(
-            compiled.admission.result_logical_root,
-            checked.logical_root(&options)
-        );
+        assert_definition_admission(&base, &checked, &compiled, &options);
         assert_eq!(base.logical_root(&options), original);
     }
 }
@@ -1193,7 +1667,10 @@ fn boxed_data_exports_preserve_source_layouts_and_reduced_arguments() {
     let original = base.logical_root(&options);
     let mut no_execution = limits();
     no_execution.vm.max_steps = 0;
-    for case in boxed_export_cases() {
+    for case in boxed_export_cases()
+        .into_iter()
+        .chain(recursive_export_cases())
+    {
         let source = format!("def compiled : {} := {}", case.ty, case.body);
         let (declaration, checked) = checked_definition(&base, &source);
         let compiled = ir::compile_source_definition(
@@ -1206,10 +1683,7 @@ fn boxed_data_exports_preserve_source_layouts_and_reduced_arguments() {
         .unwrap_or_else(|error| panic!("{source}: {error:?}"))
         .into_complete()
         .unwrap();
-        assert_eq!(
-            compiled.admission.result_logical_root,
-            checked.logical_root(&options)
-        );
+        assert_definition_admission(&base, &checked, &compiled, &options);
         let IrDecl::Function { params, result, .. } = compiled
             .module
             .decls
@@ -1241,6 +1715,13 @@ fn boxed_data_exports_preserve_source_layouts_and_reduced_arguments() {
             let (constructors, projections) = private_data_operations(&compiled.module);
             assert!(constructors > 0 && projections > 0);
         }
+        if case.ty.contains("Wrapper") || case.ty.contains("IRBoolBox") {
+            assert_eq!(
+                private_data_operations(&compiled.module),
+                (0, 0),
+                "single-field wrappers must not allocate or project a constructor: {source}",
+            );
+        }
         assert!(matches!(
             ir::compile_source_definition(
                 &base,
@@ -1260,10 +1741,19 @@ fn boxed_data_exports_preserve_source_layouts_and_reduced_arguments() {
     // tables, in addition to their typed signature and runtime cases above.
     for source in [
         "def compiled (x : IRPayload) : IRPayload := x",
+        "def compiled (x : IRRecursive) : IRRecursive := x",
+        "def compiled (x : IRRecursiveLoop) : IRRecursiveLoop := x",
+        "def compiled (x : IRScalarBox) : IRScalarBox := x",
+        "def compiled (x : IRScalarPayload) : IRScalarPayload := x",
+        "def compiled (f : IRScalarPayload -> Nat) : Nat := f IRScalarPayload.empty",
         "def compiled (f : IRPayload -> Nat) : Nat := f IRPayload.empty",
         "def compiled (p : IRTextPair) : String := p.right",
         "def compiled (s : String) : IRTextPair := IRTextPair.mk s s",
         "def compiled (f : IRTextPair -> String) : String := f (IRTextPair.mk \"a\" \"b\")",
+        "def compiled (x : IRNatWrapper) : IRNatWrapper := x",
+        "def compiled (x : IRStringWrapper) : IRStringWrapper := x",
+        "def compiled (p : IRBoolBox) : Bool := p.value",
+        "def compiled (f : IRBoolBox -> Nat) : Nat := f (IRBoolBox.mk true)",
     ] {
         let (declaration, _) = checked_definition(&base, source);
         ir::compile_source_definition(
@@ -1280,24 +1770,24 @@ fn boxed_data_exports_preserve_source_layouts_and_reduced_arguments() {
     }
     for (source, expected) in [
         (
-            "def compiled (x : IRNatWrapper) : IRNatWrapper := x",
-            "source export carrier",
-        ),
-        (
-            "def compiled (x : IRStringWrapper) : IRStringWrapper := x",
-            "source export carrier",
-        ),
-        (
-            "def compiled (x : IRScalarBox) : IRScalarBox := x",
-            "source export carrier",
-        ),
-        (
             "def compiled (x : IRProofBox) : IRProofBox := x",
             "source export carrier",
         ),
         (
-            "def compiled (x : IRRecursive) : IRRecursive := x",
-            "source export carrier",
+            "def compiled (_ : IRRecursiveFirst) (n : Nat) : Nat := n",
+            "unused recursive source parameter",
+        ),
+        (
+            "def compiled (_ : IRRecursiveLoop) (n : Nat) : Nat := n",
+            "unused recursive source parameter",
+        ),
+        (
+            "def compiled (f : IRRecursiveTree -> IRRecursiveTree) (p : IRRecursiveTree) : Bool := match f p with | .node _ _ _ => false | .leaf _ _ => false",
+            "specializable source call",
+        ),
+        (
+            "def compiled (p : IRRecursiveTree) (_ : Nat) : Bool := match IRRecursiveTree.node p true p with | .node _ b _ => b | .leaf _ _ => false",
+            "specializable source call",
         ),
         (
             "def compiled (x : IRBoxedParam Nat) : IRBoxedParam Nat := x",
@@ -1309,6 +1799,22 @@ fn boxed_data_exports_preserve_source_layouts_and_reduced_arguments() {
         ),
         (
             "def compiled (x : IRBoxedRecord) (_ : IRWideRecord) : IRBoxedRecord := x",
+            "conflicting source constructor layouts",
+        ),
+        (
+            "def compiled (x : IRScalarBox) (_ : IRBoxedRecord) : IRScalarBox := x",
+            "conflicting source constructor layouts",
+        ),
+        (
+            "def compiled (x : IRInterleaved) (_ : IRScalarReordered) : IRInterleaved := x",
+            "conflicting source constructor layouts",
+        ),
+        (
+            "def compiled (x : IRNatWrapper) (_ : IRBoxedRecord) : IRNatWrapper := x",
+            "conflicting source constructor layouts",
+        ),
+        (
+            "def compiled (x : IRNatWrapper) (_ : IRScalarPayload) : IRNatWrapper := x",
             "conflicting source constructor layouts",
         ),
         (
@@ -1364,10 +1870,7 @@ fn source_exports_keep_source_arguments_and_compile_without_execution() {
                 "the private-data case must construct and project at runtime: {source}"
             );
         }
-        assert_eq!(
-            compiled.admission.result_logical_root,
-            checked.logical_root(&options)
-        );
+        assert_definition_admission(&base, &checked, &compiled, &options);
         let public = compiled
             .module
             .decls
@@ -1485,10 +1988,7 @@ fn source_exports_keep_source_arguments_and_compile_without_execution() {
     .unwrap()
     .into_complete()
     .unwrap();
-    assert_eq!(
-        compiled.admission.result_logical_root,
-        checked.logical_root(&options)
-    );
+    assert_definition_admission(&base, &checked, &compiled, &options);
     assert_eq!(base.logical_root(&options), original);
     for source in [
         "def compiled {A : Type} (x : A) : A := x",
@@ -1499,9 +1999,7 @@ fn source_exports_keep_source_arguments_and_compile_without_execution() {
         "def compiled : (Nat -> Nat) -> Nat -> Nat := invoke",
         "def compiled (x y : Nat) : Nat := keep x",
         "def compiled (f : Nat -> Nat) (x : Nat) : Nat := x",
-        "def compiled (p : IRBoolBox) : Bool := p.value",
         "def compiled (s : String) : IRNested := IRNested.mk (IRTextPair.mk s s)",
-        "def compiled (f : IRBoolBox -> Nat) : Nat := f (IRBoolBox.mk true)",
     ] {
         let (declaration, _) = checked_definition(&base, source);
         assert!(
@@ -2597,8 +3095,10 @@ fn consume_boxed_ir(
     // Heap fields come from IO, so retaining the caller's original value after
     // each call checks ownership of allocated payloads rather than literals.
     // Dynamic lookup also prevents logical bodies from replacing native IR.
+    // Validate both inputs even for constant cases, keeping the fixture checks
+    // meaningful and avoiding unused-binding warnings in the runtime stdout.
     let source = format!(
-        "import Lean\nimport NativeIrCase\nunsafe def main : IO Unit := do\n  let heap ← IO.FS.readFile \"heap-input.txt\"\n  let digits ← IO.FS.readFile \"heap-nat.txt\"\n  let large := digits.toNat!\n  Lean.enableInitializersExecution\n  let env ← Lean.importModules #[{{ module := `NativeIrCase, isMeta := true }}] {{}} (loadExts := true)\n  match env.evalConst ({ty}) {{}} `{entry} (checkMeta := false) with\n  | .error message => throw (IO.userError message)\n  | .ok compiled => do\n    IO.println (reprStr ({application}))\n    IO.println (reprStr ({application}))\n",
+        "import Lean\nimport NativeIrCase\nunsafe def main : IO Unit := do\n  let heap ← IO.FS.readFile \"heap-input.txt\"\n  let digits ← IO.FS.readFile \"heap-nat.txt\"\n  let large := digits.toNat!\n  unless heap == \"boxed heap payload\" do throw (IO.userError \"wrong heap String fixture\")\n  unless large == 184467440737095516160 do throw (IO.userError \"wrong heap Nat fixture\")\n  Lean.enableInitializersExecution\n  let env ← Lean.importModules #[{{ module := `NativeIrCase, isMeta := true }}] {{}} (loadExts := true)\n  match env.evalConst ({ty}) {{}} `{entry} (checkMeta := false) with\n  | .error message => throw (IO.userError message)\n  | .ok compiled => do\n    IO.println (reprStr ({application}))\n    IO.println (reprStr ({application}))\n",
     );
     let filename = format!("BoxedRuntime-{label}.lean");
     std::fs::write(dir.join(&filename), source).unwrap();
@@ -2612,6 +3112,15 @@ fn consume_boxed_ir(
 
 #[test]
 fn the_pin_executes_boxed_data_exports_and_observes_payloads() {
+    check_pin_boxed_data_exports(boxed_export_cases());
+}
+
+#[test]
+fn the_pin_executes_recursive_data_exports_and_observes_payloads() {
+    check_pin_boxed_data_exports(recursive_export_cases());
+}
+
+fn check_pin_boxed_data_exports(cases: Vec<BoxedExportCase>) {
     let Some(lean) = reference() else {
         assert!(
             std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
@@ -2635,7 +3144,7 @@ fn the_pin_executes_boxed_data_exports_and_observes_payloads() {
     let root = std::env::var_os("FLN_IR_REFERENCE_ARTIFACTS")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    for (index, case) in boxed_export_cases().into_iter().enumerate() {
+    for (index, case) in cases.into_iter().enumerate() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -2697,7 +3206,7 @@ fn the_pin_executes_boxed_data_exports_and_observes_payloads() {
                 );
             }
         }
-        if index == 0 {
+        if index == 0 && case.ty == "IRBoxedRecord" {
             let mut mutant = compiled.module.clone();
             let IrDecl::Function { body, .. } = mutant
                 .decls
@@ -2749,6 +3258,141 @@ fn the_pin_executes_boxed_data_exports_and_observes_payloads() {
                 &dir,
                 "changed-payload",
                 "(99, \"changed payload\")\n(99, \"changed payload\")",
+            );
+        }
+        if case.ty == "IRRecursive" {
+            // Keep the logical declaration fixed and change only its native
+            // executable body. The recursive consumer must observe the empty
+            // constructor instead of reconstructing the source-level chain.
+            let mut mutant = compiled.module.clone();
+            let IrDecl::Function { body, .. } = mutant
+                .decls
+                .iter_mut()
+                .find(|declaration| declaration.name() == &name("compiled"))
+                .unwrap()
+            else {
+                panic!("recursive source entry")
+            };
+            *body = IrBody {
+                stmts: vec![IrStmt::VDecl {
+                    x: 1,
+                    ty: IrType::TObject,
+                    expr: IrExpr::Lit(IrLit::Num(IrNat::Small(0))),
+                }],
+                terminal: Box::new(IrTerminal::Ret(IrArg::Var(1))),
+            };
+            std::fs::write(dir.join("NativeIrCase.ir"), encode(&mutant, &original)).unwrap();
+            assert_probe(
+                consume_boxed_ir(
+                    &lean,
+                    &dir,
+                    "changed-recursive-tag",
+                    case.ty,
+                    case.application,
+                    "compiled",
+                ),
+                &dir,
+                "changed-recursive-tag",
+                "0\n0",
+            );
+        }
+        if case.ty == "IRScalarBox" {
+            // Change only the Boolean payload. This consumer must read the
+            // packed byte from native IR, not the companion logical body.
+            let mut mutant = compiled.module.clone();
+            let IrDecl::Function { body, .. } = mutant
+                .decls
+                .iter_mut()
+                .find(|declaration| declaration.name() == &name("compiled"))
+                .unwrap()
+            else {
+                panic!("scalar source entry")
+            };
+            *body = IrBody {
+                stmts: vec![
+                    IrStmt::VDecl {
+                        x: 1,
+                        ty: IrType::TObject,
+                        expr: IrExpr::Lit(IrLit::Num(IrNat::Small(42))),
+                    },
+                    IrStmt::VDecl {
+                        x: 2,
+                        ty: IrType::UInt8,
+                        expr: IrExpr::Lit(IrLit::Num(IrNat::Small(0))),
+                    },
+                    IrStmt::VDecl {
+                        x: 3,
+                        ty: IrType::Object,
+                        expr: IrExpr::Ctor {
+                            info: fln_olean::ir::IrCtorInfo {
+                                name: name("IRScalarBox.mk"),
+                                cidx: 0,
+                                size: 1,
+                                usize: 0,
+                                ssize: 1,
+                            },
+                            args: vec![IrArg::Var(1)],
+                        },
+                    },
+                    IrStmt::SSet {
+                        x: 3,
+                        i: 1,
+                        offset: 0,
+                        y: 2,
+                        ty: IrType::UInt8,
+                    },
+                ],
+                terminal: Box::new(IrTerminal::Ret(IrArg::Var(3))),
+            };
+            std::fs::write(dir.join("NativeIrCase.ir"), encode(&mutant, &original)).unwrap();
+            assert_probe(
+                consume_boxed_ir(
+                    &lean,
+                    &dir,
+                    "changed-scalar",
+                    case.ty,
+                    case.application,
+                    "compiled",
+                ),
+                &dir,
+                "changed-scalar",
+                "(42, false)\n(42, false)",
+            );
+        }
+        if case.ty == "IRNatWrapper" {
+            // A wrapper is the underlying Nat, not a one-slot allocation.
+            // Alter only native IR so the pin must observe this representation
+            // instead of evaluating the unchanged logical constructor body.
+            let mut mutant = compiled.module.clone();
+            let IrDecl::Function { body, .. } = mutant
+                .decls
+                .iter_mut()
+                .find(|declaration| declaration.name() == &name("compiled"))
+                .unwrap()
+            else {
+                panic!("unboxed wrapper source entry")
+            };
+            *body = IrBody {
+                stmts: vec![IrStmt::VDecl {
+                    x: 1,
+                    ty: IrType::TObject,
+                    expr: IrExpr::Lit(IrLit::Num(IrNat::Small(99))),
+                }],
+                terminal: Box::new(IrTerminal::Ret(IrArg::Var(1))),
+            };
+            std::fs::write(dir.join("NativeIrCase.ir"), encode(&mutant, &original)).unwrap();
+            assert_probe(
+                consume_boxed_ir(
+                    &lean,
+                    &dir,
+                    "changed-wrapper",
+                    case.ty,
+                    case.application,
+                    "compiled",
+                ),
+                &dir,
+                "changed-wrapper",
+                "99\n99",
             );
         }
     }
@@ -3059,10 +3703,7 @@ fn the_pin_executes_multiargument_calls_and_reduced_let_exports() {
                 .unwrap_or_else(|error| panic!("{source}: {error:?}"))
                 .into_complete()
                 .unwrap();
-                assert_eq!(
-                    compiled.admission.result_logical_root,
-                    checked.logical_root(&options)
-                );
+                assert_definition_admission(&base, &checked, &compiled, &options);
                 assert_eq!(base.logical_root(&options), original_root);
                 let unique = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -3360,7 +4001,7 @@ fn check_pin_string_exports(consuming_predicates: bool) {
                 .unwrap_or_else(|error| panic!("{source}: {error:?}"))
                 .into_complete()
                 .unwrap();
-                assert_eq!(compiled.admission.result_logical_root, checked.logical_root(&options));
+                assert_definition_admission(&base, &checked, &compiled, &options);
                 assert_eq!(base.logical_root(&options), original_root);
                 let native = name(case.native);
                 assert!(compiled.module.decls.iter().any(|declaration| {
@@ -3500,10 +4141,7 @@ fn check_pin_source_exports(case_indices: std::ops::Range<usize>) {
         .unwrap_or_else(|e| panic!("{source}: {e:?}"))
         .into_complete()
         .unwrap();
-        assert_eq!(
-            compiled.admission.result_logical_root,
-            checked.logical_root(&options)
-        );
+        assert_definition_admission(&base, &checked, &compiled, &options);
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

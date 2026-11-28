@@ -7,9 +7,12 @@
 //! of kernel admission or faithful byte identity. Module publication must bind
 //! the entry and additional names to its own checked declaration/ABI contract.
 //! `compile_source_definition` additionally exports closed Nat/String/Bool,
-//! fieldless enums and nonrecursive data with boxed Nat/String fields, under
-//! their source names and the pin's object/scalar conventions. Type-dependent
-//! runtime carriers and packed scalar fields remain unsupported. Acyclic control flow preserves
+//! fieldless enums and closed data with Nat/String/Bool or direct self fields, under
+//! their source names and the pin's object/scalar conventions. Boolean fields
+//! use the same packed-byte layout as their persisted compiler metadata.
+//! Single-field wrappers erase to their primitive field in a singleton-layout
+//! profile, including values passed through higher-order source parameters.
+//! Type-dependent runtime carriers remain unsupported. Acyclic control flow preserves
 //! reachable branches and their ownership cleanup; expansion is work/depth bounded.
 //! Type/proof slots retain their original source positions.
 //! Closed source exports may use private boxed data and dictionaries internally.
@@ -268,14 +271,61 @@ impl ConstructorTags {
     }
 }
 
-/// Native source data has an all-boxed representation. Checked closed data
-/// reserves its ordinal tags and field counts; other layouts stay private.
+/// Checked closed data reserves its ordinal tags and field layouts; other
+/// layouts stay private and boxed. The Golem producer still uses source-order
+/// object slots, so packed public fields require an explicit mapping at both
+/// construction and projection rather than an unchecked object cast.
 /// Assigning private tags by the *whole* layout preserves the VM's shape tests:
 /// two constructors with tag zero but different field counts must stay distinct.
 struct InternalConstructors {
     type_name: Name,
     layouts: std::collections::BTreeMap<(u8, u16), u8>,
+    packed: std::collections::BTreeMap<u8, PackedConstructor>,
+    unboxed: bool,
     tags: ConstructorTags,
+}
+
+#[derive(Clone, Copy)]
+enum ConstructorField {
+    Object(u16),
+    Bool(u16),
+}
+
+struct PackedConstructor {
+    fields: Vec<ConstructorField>,
+    objects: u16,
+    bytes: u16,
+}
+
+impl PackedConstructor {
+    fn from_fields(fields: &[IrType], meter: &mut Budget) -> Result<Option<Self>> {
+        meter.charge(fields.len())?;
+        if !fields.iter().any(|ty| *ty == IrType::UInt8) {
+            return Ok(None);
+        }
+        let mut layout = Self {
+            fields: Vec::new(),
+            objects: 0,
+            bytes: 0,
+        };
+        layout
+            .fields
+            .try_reserve_exact(fields.len())
+            .map_err(|_| CompileError::Allocation)?;
+        for ty in fields {
+            let field = if *ty == IrType::UInt8 {
+                let field = ConstructorField::Bool(layout.bytes);
+                layout.bytes = layout.bytes.checked_add(1).ok_or(CompileError::Limit)?;
+                field
+            } else {
+                let field = ConstructorField::Object(layout.objects);
+                layout.objects = layout.objects.checked_add(1).ok_or(CompileError::Limit)?;
+                field
+            };
+            layout.fields.push(field);
+        }
+        Ok(Some(layout))
+    }
 }
 
 impl InternalConstructors {
@@ -286,12 +336,27 @@ impl InternalConstructors {
             .ok_or_else(|| unsupported("unproved internal constructor layout"))
     }
     fn info(&self, tag: u8, fields: u16) -> IrCtorInfo {
+        let (objects, bytes) = self
+            .packed
+            .get(&tag)
+            .map_or((fields, 0), |layout| (layout.objects, layout.bytes));
         IrCtorInfo {
             name: Name::num(self.type_name.clone(), u64::from(tag)),
             cidx: u64::from(tag),
-            size: u64::from(fields),
+            size: u64::from(objects),
             usize: 0,
-            ssize: 0,
+            ssize: u64::from(bytes),
+        }
+    }
+
+    fn field(&self, tag: u8, index: u16) -> Result<ConstructorField> {
+        match self.packed.get(&tag) {
+            Some(layout) => layout
+                .fields
+                .get(usize::from(index))
+                .copied()
+                .ok_or_else(|| invariant("packed constructor field")),
+            None => Ok(ConstructorField::Object(index)),
         }
     }
 }
@@ -646,25 +711,59 @@ fn compile_body(
                     // them. Keep an independent owner for every stored slot,
                     // including repeated aliases and captured closures.
                     out.meter.charge(fields.len())?;
-                    let mut args = Vec::new();
-                    args.try_reserve_exact(fields.len())
-                        .map_err(|_| CompileError::Allocation)?;
-                    for field in fields {
+                    let mut value = if out.constructors.unboxed {
+                        let [field] = fields.as_slice() else {
+                            return Err(invariant("unboxed constructor field"));
+                        };
                         let value = out.get(*field)?;
                         out.retain(value)?;
-                        args.push(IrArg::Var(value.index));
-                    }
-                    let mut value = out.bind(
-                        if fields.is_empty() {
-                            IrType::Tagged
-                        } else {
-                            IrType::Object
-                        },
-                        IrExpr::Ctor {
-                            info: out.constructors.info(tag, field_count),
-                            args,
-                        },
-                    )?;
+                        Value {
+                            owned: true,
+                            ..value
+                        }
+                    } else {
+                        let mut args = Vec::new();
+                        args.try_reserve_exact(fields.len())
+                            .map_err(|_| CompileError::Allocation)?;
+                        let mut scalars = Vec::new();
+                        scalars
+                            .try_reserve_exact(fields.len())
+                            .map_err(|_| CompileError::Allocation)?;
+                        for (index, field) in fields.iter().enumerate() {
+                            let value = out.get(*field)?;
+                            match out.constructors.field(tag, index as u16)? {
+                                ConstructorField::Object(_) => {
+                                    out.retain(value)?;
+                                    args.push(IrArg::Var(value.index));
+                                }
+                                ConstructorField::Bool(offset) => {
+                                    let value =
+                                        out.bind(IrType::UInt8, IrExpr::Unbox { x: value.index })?;
+                                    scalars.push((offset, value.index));
+                                }
+                            }
+                        }
+                        let info = out.constructors.info(tag, field_count);
+                        let object_count = info.size;
+                        let value = out.bind(
+                            if fields.is_empty() {
+                                IrType::Tagged
+                            } else {
+                                IrType::Object
+                            },
+                            IrExpr::Ctor { info, args },
+                        )?;
+                        for (offset, y) in scalars {
+                            out.emit(IrStmt::SSet {
+                                x: value.index,
+                                i: object_count,
+                                offset: u64::from(offset),
+                                y,
+                                ty: IrType::UInt8,
+                            })?;
+                        }
+                        value
+                    };
                     value.constructor_tags = ConstructorTags::singleton(tag);
                     out.set(*dst, value)?;
                 }
@@ -752,13 +851,43 @@ fn compile_body(
                     // IR projection borrows the field. The FLBC instruction
                     // returns an owner, which must survive releasing its parent
                     // or replacing the source register with the field itself.
-                    let value = out.bind(
-                        IrType::TObject,
-                        IrExpr::Proj {
-                            i: u64::from(*field),
-                            x: source.index,
-                        },
-                    )?;
+                    let value = if out.constructors.unboxed {
+                        // The only constructor is erased to its field. The
+                        // checked singleton domain also removes every tag
+                        // guard: a large Nat or String has no wrapper header.
+                        Value {
+                            owned: true,
+                            constructor_tags: ConstructorTags::default(),
+                            ..source
+                        }
+                    } else {
+                        match out.constructors.field(tag, *field)? {
+                            ConstructorField::Object(index) => out.bind(
+                                IrType::TObject,
+                                IrExpr::Proj {
+                                    i: u64::from(index),
+                                    x: source.index,
+                                },
+                            )?,
+                            ConstructorField::Bool(offset) => {
+                                let value = out.bind(
+                                    IrType::UInt8,
+                                    IrExpr::SProj {
+                                        n: out.constructors.info(tag, *expected_fields).size,
+                                        offset: u64::from(offset),
+                                        x: source.index,
+                                    },
+                                )?;
+                                out.bind(
+                                    IrType::Tagged,
+                                    IrExpr::Box {
+                                        ty: IrType::UInt8,
+                                        x: value.index,
+                                    },
+                                )?
+                            }
+                        }
+                    };
                     out.retain(value)?;
                     out.set(*dst, value)?;
                     if let Some(prefix) = prefix {
@@ -1098,15 +1227,27 @@ fn compile_module(
     let mut constructors = InternalConstructors {
         type_name: Name::str(entry.clone(), "_fln_data"),
         layouts: std::collections::BTreeMap::new(),
+        packed: std::collections::BTreeMap::new(),
+        unboxed: false,
         tags: ConstructorTags::default(),
     };
     if let Some(source) = source_exports {
         // Caller-supplied data uses the pin's canonical ordinal tags and
-        // object-field counts, including values constructed only in callbacks.
-        for (index, &fields) in source.constructor_fields.iter().enumerate() {
+        // packed layout, including values constructed only in callbacks.
+        for (index, layout) in source.constructor_fields.iter().enumerate() {
             meter.charge(1)?;
             let tag = u8::try_from(index).map_err(|_| CompileError::Limit)?;
-            constructors.layouts.insert((tag, fields), tag);
+            let fields = layout.fields();
+            let count = u16::try_from(fields.len()).map_err(|_| CompileError::Limit)?;
+            constructors.layouts.insert((tag, count), tag);
+            if matches!(layout, SourceConstructor::Unboxed(_)) {
+                if source.constructor_fields.len() != 1 || tag != 0 || count != 1 {
+                    return Err(invariant("unboxed source constructor shape"));
+                }
+                constructors.unboxed = true;
+            } else if let Some(packed) = PackedConstructor::from_fields(fields, meter)? {
+                constructors.packed.insert(tag, packed);
+            }
             constructors.tags.insert(tag);
         }
         for constructor in program.constructors() {
@@ -1116,6 +1257,19 @@ fn compile_module(
             }
             for field in &constructor.fields {
                 carrier(*field, true)?;
+            }
+            if constructors.unboxed
+                && (constructor.tag != 0
+                    || !matches!(
+                        constructor.fields.as_slice(),
+                        [fir::ValueType::Nat | fir::ValueType::String | fir::ValueType::Bool]
+                    ))
+            {
+                // Erased wrappers have no constructor header to inspect. Keep
+                // the complete runtime domain at one proven source shape;
+                // a private sum or a nested/closure field cannot borrow this
+                // representation merely by sharing the source ordinal.
+                return Err(unsupported("unboxed source constructor layouts"));
             }
             let fields =
                 u16::try_from(constructor.fields.len()).map_err(|_| CompileError::Limit)?;
@@ -1129,6 +1283,19 @@ fn compile_module(
                 }
                 layout.insert(tag);
                 constructors.tags.insert(tag);
+            }
+            let tag = constructors.tag(constructor.tag, fields)?;
+            if let Some(layout) = constructors.packed.get(&tag) {
+                // Golem's private layouts forget source type identities. A
+                // coincidentally equal tag/field count is not evidence that
+                // an object or closure may be unboxed as a Boolean. Refuse
+                // that collision before any packed constructor is emitted.
+                for (field, ty) in layout.fields.iter().zip(&constructor.fields) {
+                    meter.charge(1)?;
+                    if matches!(field, ConstructorField::Bool(_)) && *ty != fir::ValueType::Bool {
+                        return Err(unsupported("conflicting source constructor layouts"));
+                    }
+                }
             }
         }
     }
@@ -1291,9 +1458,26 @@ struct SourceSignature {
     /// Exact inference is currently available for the checked recursive
     /// primitive/enum profile. Other exports retain their owned adapters.
     inferred_borrowing: bool,
-    /// The public layout at each canonical constructor ordinal, collected
-    /// through the complete source signature, including callback types.
-    constructor_fields: Vec<u16>,
+    /// Source-order field carriers at each public constructor ordinal,
+    /// collected through the complete signature, including callback types.
+    /// Boolean slots are packed after all object slots in ordinary constructors;
+    /// a trivial wrapper instead has the representation of its only field.
+    constructor_fields: Vec<SourceConstructor>,
+}
+
+#[derive(Clone)]
+enum SourceConstructor {
+    Standard(Vec<IrType>),
+    Unboxed(IrType),
+}
+
+impl SourceConstructor {
+    fn fields(&self) -> &[IrType] {
+        match self {
+            Self::Standard(fields) => fields,
+            Self::Unboxed(field) => std::slice::from_ref(field),
+        }
+    }
 }
 
 enum ReducedArgument {
@@ -1887,6 +2071,117 @@ impl SourceUses<'_, '_> {
         Ok(Some([left, right]))
     }
 
+    /// A checked case that selects a constructor field necessarily retains its
+    /// dynamic major. Follow that dependency through an unknown callback too,
+    /// while leaving constant-arm and known-constructor specialization outside
+    /// this profile. Motives are erased; actual minor captures remain relevant.
+    fn projection_case(
+        &mut self,
+        head: &fln_core::expr::Expr,
+        arguments: &[&fln_core::expr::Expr],
+        locals: &mut Vec<SourceUseBinding>,
+        depth: usize,
+    ) -> Result<Option<SourceUse>> {
+        use fln_core::expr::ExprNode;
+        use fln_env::constants::ConstantInfo;
+
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Ok(None);
+        };
+        let Some(ConstantInfo::Rec(recursor)) = self.environment.find(name) else {
+            return Ok(None);
+        };
+        let [family] = recursor.all.as_slice() else {
+            return Ok(None);
+        };
+        if recursor.is_unsafe
+            || recursor.num_params != 0
+            || recursor.num_indices != 0
+            || recursor.num_motives != 1
+            || levels.len() != recursor.base.level_params.len()
+            || arguments.len() != recursor.num_minors as usize + 2
+        {
+            return Ok(None);
+        }
+        let Some(layout) = source_data_layout(family, self.environment, self.meter)? else {
+            return Ok(None);
+        };
+        if layout.constructors().len() != recursor.num_minors as usize
+            || recursor.rules.len() != recursor.num_minors as usize
+        {
+            return Ok(None);
+        }
+        // The spine is reversed: major, last minor, ..., first minor, motive.
+        // A parameter-headed application cannot expose a known constructor to
+        // the pin's simplifier. A let alias or an explicit constructor can.
+        let major = arguments[0];
+        let mut major_head = source_without_metadata(major, self.meter)?;
+        while let ExprNode::App { f, .. } = major_head.node() {
+            self.meter.charge(1)?;
+            major_head = source_without_metadata(f, self.meter)?;
+        }
+        let ExprNode::BVar { idx } = major_head.node() else {
+            return Ok(None);
+        };
+        let index = locals
+            .len()
+            .checked_sub(*idx as usize + 1)
+            .ok_or_else(|| unsupported("open source case"))?;
+        if !locals[index].parameter {
+            return Ok(None);
+        }
+        let mut projects_field = false;
+        for (index, (constructor, fields)) in layout.constructors().enumerate() {
+            self.meter.charge(1)?;
+            let rule = &recursor.rules[index];
+            if &rule.ctor != constructor || rule.nfields as usize != fields.len() {
+                return Ok(None);
+            }
+            let mut body = arguments[recursor.num_minors as usize - index];
+            let mut binders = 0;
+            loop {
+                body = source_without_metadata(body, self.meter)?;
+                let ExprNode::Lam { body: next, .. } = body.node() else {
+                    break;
+                };
+                self.meter.charge(1)?;
+                binders += 1;
+                body = next;
+            }
+            if binders < fields.len() {
+                return Ok(None);
+            }
+            if let ExprNode::BVar { idx } = body.node() {
+                if (*idx as usize) < binders {
+                    // Constructor fields precede the induction hypotheses in
+                    // the checked minor telescope. An IH is not a projection.
+                    let field = binders - *idx as usize - 1;
+                    if field >= fields.len() {
+                        return Ok(None);
+                    }
+                    projects_field = true;
+                }
+            } else if body.has_loose_bvars() {
+                return Ok(None);
+            }
+        }
+        if !projects_field {
+            return Ok(None);
+        }
+        self.metadata()?;
+        if self.externs.as_ref().unwrap().get(name).is_some()
+            || self.replacements.as_ref().unwrap().get(name).is_some()
+        {
+            return Err(unsupported("source case replacement"));
+        }
+        let mut used = self.value(major, locals, depth + 1)?;
+        for minor in &arguments[1..arguments.len() - 1] {
+            let capture = self.value(minor, locals, depth + 1)?;
+            self.merge(&mut used, &capture)?;
+        }
+        Ok(Some(used))
+    }
+
     fn value(
         &mut self,
         expression: &fln_core::expr::Expr,
@@ -1940,6 +2235,9 @@ impl SourceUses<'_, '_> {
                     arguments.push(a);
                     head = source_without_metadata(f, self.meter)?;
                 }
+                if let Some(used) = self.projection_case(head, &arguments, locals, depth)? {
+                    return Ok(used);
+                }
                 if let ExprNode::Const { name, levels } = head.node()
                     && levels.is_empty()
                     && let Some(fln_env::constants::ConstantInfo::Ctor(constructor)) =
@@ -1964,10 +2262,9 @@ impl SourceUses<'_, '_> {
                     {
                         return Err(unsupported("source constructor replacement"));
                     }
-                    // Every supported field is relevant and boxed, and the
-                    // constructor is nontrivial. Construction retains each
-                    // field's dependencies; no scalar erasure or wrapper
-                    // elimination can silently change the reduced telescope.
+                    // Every supported field is relevant. Allocation and
+                    // single-field wrapper erasure both preserve the field's
+                    // dependencies; neither can change the reduced telescope.
                     let mut used = self.empty(true)?;
                     let mut discardable = true;
                     for argument in arguments {
@@ -2125,7 +2422,7 @@ fn source_data_layout(
 
 fn reserve_source_layout(
     layout: &CompilerData,
-    fields: &mut Vec<u16>,
+    fields: &mut Vec<SourceConstructor>,
     meter: &mut Budget,
 ) -> Result<()> {
     meter.charge(layout.constructors().len())?;
@@ -2133,16 +2430,37 @@ fn reserve_source_layout(
         .try_reserve(layout.constructors().len().saturating_sub(fields.len()))
         .map_err(|_| CompileError::Allocation)?;
     for (index, (_, constructor_fields)) in layout.constructors().enumerate() {
-        let count = u16::try_from(constructor_fields.len()).map_err(|_| CompileError::Limit)?;
+        meter.charge(constructor_fields.len())?;
         if let Some(previous) = fields.get(index) {
+            if layout.unboxed_field().is_some() {
+                if !matches!(previous, SourceConstructor::Unboxed(_)) {
+                    return Err(unsupported("conflicting source constructor layouts"));
+                }
+                continue;
+            }
+            let SourceConstructor::Standard(previous) = previous else {
+                return Err(unsupported("conflicting source constructor layouts"));
+            };
             // The private compiler distinguishes the complete runtime shape.
             // Two public types may share a shape, but not assign different
-            // field counts to the same canonical source ordinal.
-            if *previous != count {
+            // layouts to the same canonical source ordinal. Nat and String
+            // both occupy object slots; Bool changes a slot's representation.
+            if previous.len() != constructor_fields.len()
+                || previous
+                    .iter()
+                    .zip(constructor_fields)
+                    .any(|(left, right)| (*left == IrType::UInt8) != (*right == IrType::UInt8))
+            {
                 return Err(unsupported("conflicting source constructor layouts"));
             }
+        } else if let Some(field) = layout.unboxed_field() {
+            fields.push(SourceConstructor::Unboxed(field.clone()));
         } else {
-            fields.push(count);
+            let mut copy = Vec::new();
+            copy.try_reserve_exact(constructor_fields.len())
+                .map_err(|_| CompileError::Allocation)?;
+            copy.extend_from_slice(constructor_fields);
+            fields.push(SourceConstructor::Standard(copy));
         }
     }
     Ok(())
@@ -2173,6 +2491,21 @@ fn source_data_default(
             layout.carrier().clone(),
         )));
     }
+    // A nullary first constructor above is a valid inhabitant even for a
+    // recursive family. A recursive field cannot otherwise be replaced with a
+    // Nat/String dummy merely because it has the same object carrier; some
+    // recursive families have no finite inhabitant at all.
+    if layout.is_recursive() {
+        return Err(unsupported("unused recursive source parameter"));
+    }
+    if let Some(field) = layout.unboxed_field() {
+        let literal = match field {
+            IrType::TObject | IrType::UInt8 => IrLit::Num(IrNat::Small(0)),
+            IrType::Object => IrLit::Str(String::new()),
+            _ => return Err(invariant("unboxed source field carrier")),
+        };
+        return Ok(Some(ReducedArgument::Literal(literal, field.clone())));
+    }
     let mut fields = Vec::new();
     fields
         .try_reserve_exact(first_fields.len())
@@ -2180,19 +2513,20 @@ fn source_data_default(
     for ty in first_fields {
         meter.charge(1)?;
         let literal = match ty {
-            IrType::TObject => IrLit::Num(IrNat::Small(0)),
+            IrType::TObject | IrType::UInt8 => IrLit::Num(IrNat::Small(0)),
             IrType::Object => IrLit::Str(String::new()),
             _ => return Err(invariant("source data field carrier")),
         };
         fields.push((literal, ty.clone()));
     }
+    let scalar_bytes = fields.iter().filter(|(_, ty)| *ty == IrType::UInt8).count();
     Ok(Some(ReducedArgument::Constructor(
         IrCtorInfo {
             name: first_name.clone(),
             cidx: 0,
-            size: fields.len() as u64,
+            size: (fields.len() - scalar_bytes) as u64,
             usize: 0,
-            ssize: 0,
+            ssize: scalar_bytes as u64,
         },
         fields,
     )))
@@ -2203,7 +2537,7 @@ fn source_data_default(
 fn source_carrier(
     ty: &fln_core::expr::Expr,
     environment: &crate::Environment,
-    constructor_fields: &mut Vec<u16>,
+    constructor_fields: &mut Vec<SourceConstructor>,
     meter: &mut Budget,
 ) -> Result<IrType> {
     use fln_core::expr::ExprNode;
@@ -2557,26 +2891,35 @@ fn export_source(
                     IrArg::Var(x)
                 }
                 ReducedArgument::Constructor(info, fields) => {
-                    meter.charge(fields.len().saturating_mul(2).saturating_add(1))?;
+                    meter.charge(fields.len().saturating_mul(3).saturating_add(1))?;
                     stmts
-                        .try_reserve(fields.len().saturating_add(1))
+                        .try_reserve(fields.len().saturating_mul(2).saturating_add(1))
                         .map_err(|_| CompileError::Allocation)?;
                     let mut fields_args = Vec::new();
                     fields_args
                         .try_reserve_exact(fields.len())
                         .map_err(|_| CompileError::Allocation)?;
+                    let mut scalar_args = Vec::new();
+                    scalar_args
+                        .try_reserve_exact(fields.len())
+                        .map_err(|_| CompileError::Allocation)?;
                     for (literal, ty) in fields {
                         let x = next;
                         next = next.checked_add(1).ok_or(CompileError::Limit)?;
+                        if ty == IrType::UInt8 {
+                            scalar_args.push(x);
+                        } else {
+                            fields_args.push(IrArg::Var(x));
+                        }
                         stmts.push(IrStmt::VDecl {
                             x,
                             ty,
                             expr: IrExpr::Lit(literal),
                         });
-                        fields_args.push(IrArg::Var(x));
                     }
                     let x = next;
                     next = next.checked_add(1).ok_or(CompileError::Limit)?;
+                    let object_count = info.size;
                     stmts.push(IrStmt::VDecl {
                         x,
                         ty: IrType::Object,
@@ -2585,6 +2928,15 @@ fn export_source(
                             args: fields_args,
                         },
                     });
+                    for (offset, y) in scalar_args.into_iter().enumerate() {
+                        stmts.push(IrStmt::SSet {
+                            x,
+                            i: object_count,
+                            offset: offset as u64,
+                            y,
+                            ty: IrType::UInt8,
+                        });
+                    }
                     IrArg::Var(x)
                 }
             });
@@ -2670,9 +3022,11 @@ pub fn compile_definition(
 /// Export a checked definition under its source name and source argument count.
 /// Runtime types are closed arrows over Nat/String/Bool and checked closed data
 /// (including higher-order arguments), using the pin's object/scalar parameters.
-/// Data has 1..=244 constructors with only Nat/String fields and no parameters,
-/// indices or recursion. Single-field wrappers, scalar packing and conflicting
-/// public shapes at one ordinal remain unsupported. Source type/proof slots are
+/// Data has 1..=244 constructors with Nat/String/Bool or direct self fields and
+/// no parameters or indices. Nonrecursive single-field wrappers erase to their
+/// primitive field when all runtime constructors share that singleton shape.
+/// Nested and mutual recursion and conflicting public shapes at one ordinal
+/// remain unsupported. Source type/proof slots are
 /// classified in their original telescope and retained as erased parameters.
 /// A runtime carrier depending on a source type parameter remains unsupported.
 /// Source arrows require an explicit lambda telescope. Multiple arguments allow
@@ -2780,7 +3134,10 @@ fn recursive_source_wrapper(
         let mut constructor_fields = Vec::new();
         source_carrier(expression, environment, &mut constructor_fields, meter)?;
         meter.charge(constructor_fields.len())?;
-        if constructor_fields.iter().any(|fields| *fields != 0) {
+        if constructor_fields
+            .iter()
+            .any(|layout| !layout.fields().is_empty())
+        {
             return Err(unsupported(SIGNATURE));
         }
         Ok(())

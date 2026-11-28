@@ -21,12 +21,19 @@ pub(super) struct Telescope<'a> {
     expected: Option<Expr>,
     expected_body: Option<Expr>,
     lambda: bool,
+    /// A local recursive header resolves written annotations with its temporary
+    /// self in scope. Inferred domains must not retain that discarded binder.
+    signature_self: Option<FVarId>,
     pub(super) body: &'a Syntax,
 }
 
 impl Telescope<'_> {
     pub(super) fn parameters(&self) -> &[LocalDecl] {
         &self.locals
+    }
+
+    pub(super) fn set_signature_self(&mut self, marker: Option<&FVarId>) {
+        self.signature_self = marker.cloned();
     }
 }
 
@@ -372,6 +379,7 @@ impl Context {
             expected_body: if lambda { expected.clone() } else { None },
             expected,
             lambda,
+            signature_self: None,
             body,
         };
         if !explicit {
@@ -514,6 +522,7 @@ impl Context {
             expected: Some(expected.clone()),
             expected_body: Some(reduced),
             lambda: true,
+            signature_self: None,
             body: syntax,
         };
         self.open_implicit_lambda_prefix(&mut state)?;
@@ -589,6 +598,24 @@ impl Context {
                 let level = self.level()?;
                 let domain = if let Some(hint) = hint {
                     hint
+                } else if let Some(marker) = &state.signature_self {
+                    // Written annotations above still see the local self, so
+                    // shadowing and invalid recursive domains are checked as
+                    // written. Only this fresh inference hole uses the scope
+                    // that survives the temporary header. Match the omitted
+                    // result telescope's exclusion of private predefinitions.
+                    let saved = self.txn.lctx.clone();
+                    let mut inference = LocalContext::new();
+                    for local in saved.decls() {
+                        self.tick()?;
+                        if &local.id != marker && !self.is_private_self(&local.id) {
+                            tactics::eliminate::add_local(&mut inference, local);
+                        }
+                    }
+                    self.txn.lctx = inference;
+                    let domain = self.hole(Expr::sort(level.clone()));
+                    self.txn.lctx = saved;
+                    domain?
                 } else {
                     self.hole(Expr::sort(level.clone()))?
                 };
@@ -681,7 +708,9 @@ impl Context {
                 let mut outer = LocalContext::new();
                 for local in locals.decls() {
                     self.tick()?;
-                    if !self.is_private_self(&local.id) {
+                    if state.signature_self.as_ref() != Some(&local.id)
+                        && !self.is_private_self(&local.id)
+                    {
                         tactics::eliminate::add_local(&mut outer, local);
                     }
                 }

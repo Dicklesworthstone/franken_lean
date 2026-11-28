@@ -113,15 +113,31 @@ fn take_bridge_refuses_contract_drift_without_erasing_other_rule_telescope_binde
         ));
     }
     let mut unmodified = 0;
+    let mut reviewed_tasks = 0;
     for row in EXTERN_ROWS {
         if row.name != TAKE && row.ownership == "rule(borrowed-args,owned-result)" {
+            let task_arity = match row.name {
+                "BaseIO.asTask" => Some(2),
+                "BaseIO.mapTask" | "BaseIO.bindTask" => Some(4),
+                "IO.wait" | "IO.getTaskState" | "IO.waitAny" => Some(1),
+                _ => None,
+            };
+            let expected = if let Some(arity) = task_arity {
+                reviewed_tasks += 1;
+                arity
+            } else {
+                unmodified += 1;
+                row.arity as usize
+            };
             assert_eq!(
                 native_signature::inferred_arity(row).unwrap(),
-                row.arity as usize
+                expected,
+                "{}",
+                row.id
             );
-            unmodified += 1;
         }
     }
+    assert_eq!(reviewed_tasks, 6);
     assert!(unmodified > 0);
 }
 

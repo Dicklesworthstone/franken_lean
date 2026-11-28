@@ -19,6 +19,8 @@ use fln_core::name::Name;
 use fln_rt::convert::{CheckedExpr, Conversion, ConvertError, ExprConstructor, inject_expr};
 use fln_rt::native_heap::NativeHeap;
 
+mod order;
+
 const MAX_EXPR_NODES: usize = 1_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -28,6 +30,8 @@ pub(super) enum Intrinsic {
     MkAppData,
     Equal,
     Eqv,
+    Lt,
+    QuickLt,
     HasLooseBVar,
     LiftLooseBVars,
     LowerLooseBVars,
@@ -60,6 +64,8 @@ impl Intrinsic {
             "extern:Lean.Expr.mkAppData" => Self::MkAppData,
             "extern:Lean.Expr.equal" => Self::Equal,
             "extern:Lean.Expr.eqv" => Self::Eqv,
+            "extern:Lean.Expr.lt" => Self::Lt,
+            "extern:Lean.Expr.quickLt" => Self::QuickLt,
             "extern:Lean.Expr.hasLooseBVar" => Self::HasLooseBVar,
             "extern:Lean.Expr.liftLooseBVars" => Self::LiftLooseBVars,
             "extern:Lean.Expr.lowerLooseBVars" => Self::LowerLooseBVars,
@@ -216,6 +222,12 @@ impl Intrinsic {
                     left == right
                 };
                 Ok(IntrinsicResult::owned(Obj::mk_nat(usize::from(equal))))
+            }
+            Self::Lt | Self::QuickLt => {
+                let left = operands.expr(&args[0])?;
+                let right = operands.expr(&args[1])?;
+                let less = order::less_than(&left, &right, self == Self::QuickLt, &mut work)?;
+                Ok(IntrinsicResult::owned(Obj::mk_nat(usize::from(less))))
             }
             Self::HasLooseBVar => {
                 let expr = operands.expr(&args[0])?;

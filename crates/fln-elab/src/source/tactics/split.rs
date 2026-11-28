@@ -11,8 +11,9 @@
 //! unfolded, and for `if b` on a `Bool` the let-bound `Bool.rec`, which the pin reads as
 //! `if b = true`. An exhaustive source `match` with explicit constructor alternatives is
 //! split through its admitted recursor. Its transparent source annotation retains the written
-//! alternative order and field names that recursor lowering otherwise loses. Indexed,
-//! overlapping, matrix and unannotated imported matches retain a typed refusal.
+//! alternative order and field names that recursor lowering otherwise loses. Independent
+//! local indices use the same checked elimination. Constrained indexed, overlapping, matrix
+//! and unannotated imported matches retain a typed refusal.
 //! Computed discriminants are generalized only in their matcher applications, with checked
 //! equations relating the original terms to each constructor; other occurrences stay fixed.
 //!

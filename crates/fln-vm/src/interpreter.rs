@@ -596,6 +596,10 @@ enum IntrinsicImplementation {
     DbgTrace,
     Float(floats::Intrinsic),
     StringInternal(strings::Intrinsic),
+    BoolToSmallWord(&'static str),
+    BoolToWideWord(&'static str),
+    StrictAnd,
+    StrictOr,
     BaseIoAsTask,
     BaseIoBindTask,
     BaseIoMapTask,
@@ -967,6 +971,18 @@ impl IntrinsicImplementation {
         match row {
             "extern:panicCore" => Self::PanicCore,
             "extern:dbgTrace" => Self::DbgTrace,
+            "extern:Bool.toUInt8" => Self::BoolToSmallWord("Bool.toUInt8"),
+            "extern:Bool.toUInt16" => Self::BoolToSmallWord("Bool.toUInt16"),
+            "extern:Bool.toUInt32" => Self::BoolToSmallWord("Bool.toUInt32"),
+            "extern:Bool.toInt8" => Self::BoolToSmallWord("Bool.toInt8"),
+            "extern:Bool.toInt16" => Self::BoolToSmallWord("Bool.toInt16"),
+            "extern:Bool.toInt32" => Self::BoolToSmallWord("Bool.toInt32"),
+            "extern:Bool.toUInt64" => Self::BoolToWideWord("Bool.toUInt64"),
+            "extern:Bool.toUSize" => Self::BoolToWideWord("Bool.toUSize"),
+            "extern:Bool.toInt64" => Self::BoolToWideWord("Bool.toInt64"),
+            "extern:Bool.toISize" => Self::BoolToWideWord("Bool.toISize"),
+            "extern:strictAnd" => Self::StrictAnd,
+            "extern:strictOr" => Self::StrictOr,
             "extern:BaseIO.asTask" => Self::BaseIoAsTask,
             "extern:BaseIO.bindTask" => Self::BaseIoBindTask,
             "extern:BaseIO.mapTask" => Self::BaseIoMapTask,
@@ -4889,7 +4905,11 @@ fn finish_intrinsic_result(
             .is_some_and(float_arrays::Intrinsic::has_wide_result)
         || matches!(
             row,
-            "extern:ByteArray.hash"
+            "extern:Bool.toUInt64"
+                | "extern:Bool.toUSize"
+                | "extern:Bool.toInt64"
+                | "extern:Bool.toISize"
+                | "extern:ByteArray.hash"
                 | "extern:ByteArray.usize"
                 | "extern:Array.usize"
                 | "extern:Lean.Expr.data"
@@ -5356,6 +5376,38 @@ fn dispatch_intrinsic(
         IntrinsicImplementation::Float(intrinsic) => intrinsic.invoke(row, args),
         IntrinsicImplementation::StringInternal(intrinsic) => {
             intrinsic.invoke(row, args, max_nat_magnitude_bytes)
+        }
+        IntrinsicImplementation::BoolToSmallWord(operation)
+        | IntrinsicImplementation::BoolToWideWord(operation) => {
+            expect_arity(row, args, 1)?;
+            let value = bool_value(&args[0], operation, 0)?;
+            // The pin's conversions all preserve 0/1. The VM carrier follows
+            // the destination's scalar ABI, including boxed 64-bit words.
+            Ok(
+                if matches!(implementation, IntrinsicImplementation::BoolToWideWord(_)) {
+                    uint64_result(u64::from(value))
+                } else {
+                    uint8_result(u8::from(value))
+                },
+            )
+        }
+        IntrinsicImplementation::StrictAnd | IntrinsicImplementation::StrictOr => {
+            expect_arity(row, args, 2)?;
+            let operation = if implementation == IntrinsicImplementation::StrictAnd {
+                "strictAnd"
+            } else {
+                "strictOr"
+            };
+            // Both arguments must satisfy Bool even when the left operand
+            // determines the result.
+            let left = bool_value(&args[0], operation, 0)?;
+            let right = bool_value(&args[1], operation, 1)?;
+            let value = if implementation == IntrinsicImplementation::StrictAnd {
+                left && right
+            } else {
+                left || right
+            };
+            Ok(uint8_result(u8::from(value)))
         }
         IntrinsicImplementation::NatAdd => {
             expect_arity(row, args, 2)?;
@@ -7996,30 +8048,34 @@ fn task_composition_argument_ownership(
     program: &ValidatedProgram,
     closure: &Obj,
     payload: &Obj,
+    with_world: bool,
 ) -> Result<Vec<ArgumentOwnership>, VmRefusal> {
-    let plan = plan_apply(program, closure, 2, None, None)?;
+    let count = 1 + usize::from(with_world);
+    let plan = plan_apply(program, closure, count, None, None)?;
     let ownership = program
         .function(plan.function)
         .and_then(|function| function.parameter_ownership.get(plan.captures.len()..))
-        .and_then(|parameters| parameters.get(..2))
+        .and_then(|parameters| parameters.get(..count))
         .ok_or(VmRefusal::MalformedClosure {
-            reason: "task composition continuation requires payload and world parameters",
+            reason: "task composition continuation parameters are absent",
         })?;
-    // finished_task_value retained the payload, so this temporary can be
-    // borrowed or consumed by the callback. The original task may still own
-    // it: neither this retain nor the internally created world grants Unique.
-    // A Scalar parameter also requires the physical value to be tagged.
+    // finished_task_value retained the payload. Its owned handle is moved
+    // into the callback frame (or partial closure), including when the
+    // callback declares Borrowed access. Dropping the source task is safe.
+    // Another task may still own the payload, so this retain cannot grant
+    // Unique. A Scalar parameter also requires the physical value to be tagged.
+    let payload_ownership = if payload.is_scalar() {
+        ArgumentOwnership::Scalar
+    } else {
+        ArgumentOwnership::Owned
+    };
     for (argument, (expected, actual)) in ownership
         .iter()
         .copied()
-        .zip([
-            if payload.is_scalar() {
-                ArgumentOwnership::Scalar
-            } else {
-                ArgumentOwnership::Owned
-            },
-            ArgumentOwnership::Scalar,
-        ])
+        .zip(
+            std::iter::once(payload_ownership)
+                .chain(with_world.then_some(ArgumentOwnership::Scalar)),
+        )
         .enumerate()
     {
         if expected == ArgumentOwnership::Unique
@@ -8096,7 +8152,7 @@ fn closure_intrinsic_application(
                 .finished_task_value()
                 .ok_or(VmRefusal::UnsupportedTaskState)?;
             let argument_ownership =
-                task_composition_argument_ownership(program, &closure, &argument)?;
+                task_composition_argument_ownership(program, &closure, &argument, true)?;
             Ok(IntrinsicApplication {
                 row,
                 closure,
@@ -8122,7 +8178,7 @@ fn closure_intrinsic_application(
                 .finished_task_value()
                 .ok_or(VmRefusal::UnsupportedTaskState)?;
             let argument_ownership =
-                task_composition_argument_ownership(program, &closure, &argument)?;
+                task_composition_argument_ownership(program, &closure, &argument, true)?;
             Ok(IntrinsicApplication {
                 row,
                 closure,
@@ -8141,11 +8197,13 @@ fn closure_intrinsic_application(
             let argument = task
                 .finished_task_value()
                 .ok_or(VmRefusal::UnsupportedTaskState)?;
+            let argument_ownership =
+                task_composition_argument_ownership(program, &closure, &argument, false)?;
             Ok(IntrinsicApplication {
                 row,
                 closure,
                 arguments: vec![argument],
-                argument_ownership: vec![ArgumentOwnership::Owned],
+                argument_ownership,
                 completion: IntrinsicCompletion::WrapPure,
                 trace: None,
             })
@@ -8159,16 +8217,22 @@ fn closure_intrinsic_application(
             let argument = task
                 .finished_task_value()
                 .ok_or(VmRefusal::UnsupportedTaskState)?;
+            let argument_ownership =
+                task_composition_argument_ownership(program, &closure, &argument, false)?;
             Ok(IntrinsicApplication {
                 row,
                 closure,
                 arguments: vec![argument],
-                argument_ownership: vec![ArgumentOwnership::Owned],
+                argument_ownership,
                 completion: IntrinsicCompletion::RequireFinishedTask,
                 trace: None,
             })
         }
-        IntrinsicImplementation::NatAdd
+        IntrinsicImplementation::BoolToSmallWord(_)
+        | IntrinsicImplementation::BoolToWideWord(_)
+        | IntrinsicImplementation::StrictAnd
+        | IntrinsicImplementation::StrictOr
+        | IntrinsicImplementation::NatAdd
         | IntrinsicImplementation::NatBeq
         | IntrinsicImplementation::NatBle
         | IntrinsicImplementation::NatSub
@@ -11249,7 +11313,10 @@ mod tests {
                 );
                 assert!(matches!(
                     invoke(of_nat, std::slice::from_ref(&negative)),
-                    Err(VmRefusal::TypeMismatch { expected: "Nat", .. })
+                    Err(VmRefusal::TypeMismatch {
+                        expected: "Nat",
+                        ..
+                    })
                 ));
             }
             for value in [

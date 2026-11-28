@@ -203,7 +203,10 @@ impl Context {
 
     /// `mkAuxDeclName infix` (vendored Lean/CoreM.lean:149-153): the generator's next name that
     /// no constant has, keeping the index it reached.
-    pub(super) fn aux_decl_name(&mut self, infix: &Name) -> Result<Name, NatDefinitionElabError> {
+    pub(in crate::source) fn aux_decl_name(
+        &mut self,
+        infix: &Name,
+    ) -> Result<Name, NatDefinitionElabError> {
         let mut names = self
             .aux_names
             .clone()
