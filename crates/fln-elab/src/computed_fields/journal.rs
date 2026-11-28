@@ -165,13 +165,20 @@ fn read(
     env: &Environment,
     budget: RecordBudget,
 ) -> Result<BTreeMap<Name, ComputedFieldEntry>, ComputedFieldError> {
+    read_with_work(env, budget).map(|(entries, _)| entries)
+}
+
+fn read_with_work(
+    env: &Environment,
+    budget: RecordBudget,
+) -> Result<(BTreeMap<Name, ComputedFieldEntry>, usize), ComputedFieldError> {
     let mut work = Builder {
         remaining: budget.max_nodes,
     };
     work.tick()?;
     let mut entries = BTreeMap::new();
     let Some(state) = env.extension(&journal_name()) else {
-        return Ok(entries);
+        return Ok((entries, budget.max_nodes - work.remaining));
     };
     if !supports(&state.descriptor) {
         return Err(ComputedFieldError::InvalidInventory);
@@ -215,11 +222,21 @@ fn read(
         }
     }
     entries.retain(|name, _| env.contains(name));
-    Ok(entries)
+    Ok((entries, budget.max_nodes - work.remaining))
 }
 
 pub fn families(env: &Environment, budget: RecordBudget) -> Result<Vec<Name>, ComputedFieldError> {
-    Ok(read(env, budget)?.into_keys().collect())
+    families_with_work(env, budget).map(|(families, _)| families)
+}
+
+/// The same claim validation, with the exact journal work consumed on success.
+/// An absent journal still includes its initial validation tick.
+pub fn families_with_work(
+    env: &Environment,
+    budget: RecordBudget,
+) -> Result<(Vec<Name>, usize), ComputedFieldError> {
+    let (entries, used) = read_with_work(env, budget)?;
+    Ok((entries.into_keys().collect(), used))
 }
 
 pub(super) fn append(
@@ -290,6 +307,30 @@ pub fn validated_family(
     let mut model = validate_inventory(env, family, &entry.fields, kernel, budget)?;
     model.inline_fields = entry.inline_fields;
     Ok(Some(model))
+}
+
+/// Regenerate the complete model under both the original per-phase limits and
+/// one aggregate allowance, reporting every phase's actual work on success.
+/// A missing family reports the checked journal cost. Errors remain terminal;
+/// callers that recover from an error must retain their own reserved allowance.
+pub fn validated_family_with_work(
+    env: &Environment,
+    family: &Name,
+    kernel: Budget,
+    budget: RecordBudget,
+    max_work: usize,
+) -> Result<(Option<ComputedFamily>, usize), ComputedFieldError> {
+    let mut work = ValidationWork::new(budget, max_work);
+    let (mut entries, used) = read_with_work(env, work.budget())?;
+    work.charge(used)?;
+    let Some(entry) = entries.remove(family) else {
+        return Ok((None, work.used()));
+    };
+    let (mut model, used) =
+        validate_inventory_with_work(env, family, &entry.fields, kernel, budget, work.remaining)?;
+    work.charge(used)?;
+    model.inline_fields = entry.inline_fields;
+    Ok((Some(model), work.used()))
 }
 
 /// Preserve source module exposure: safe logical getters may be public axiom

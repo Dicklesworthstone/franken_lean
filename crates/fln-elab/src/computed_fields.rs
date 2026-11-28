@@ -26,14 +26,16 @@ mod journal;
 mod recovery;
 pub mod tags;
 pub use journal::{
-    ComputedFieldEntry, decode_entry, families, journal_name, register, register_projected,
-    supports, validated_family,
+    ComputedFieldEntry, decode_entry, families, families_with_work, journal_name, register,
+    register_projected, supports, validated_family, validated_family_with_work,
 };
 pub use recovery::{RECOVERY_PHASES, recover_imported};
 
 /// Consumers can reserve this many `RecordBudget::max_nodes` units before a
 /// complete model validation. Each generation, metadata and comparison phase
 /// has its own explicit bound; exhaustion never means an absent model.
+/// [`validated_family_with_work`] also supports an aggregate allowance with
+/// actual consumption reported after complete validation.
 pub const VALIDATION_PHASES: usize = 6;
 
 /// The pin removes the declaration prefix from a cache-slot binder. A shared
@@ -144,6 +146,56 @@ pub struct ComputedFamily {
 pub struct Generated {
     pub declarations: Vec<Declaration>,
     pub implemented_by: Vec<(Name, Name)>,
+}
+
+/// Aggregate actual consumption without widening any independent phase's
+/// allowance. A suspended comparison builder keeps its own remaining ceiling
+/// and is additionally capped by the aggregate before it resumes.
+struct ValidationWork {
+    limit: usize,
+    remaining: usize,
+    phase: RecordBudget,
+}
+
+impl ValidationWork {
+    fn new(phase: RecordBudget, limit: usize) -> Self {
+        Self {
+            limit,
+            remaining: limit,
+            phase,
+        }
+    }
+
+    fn budget(&self) -> RecordBudget {
+        RecordBudget {
+            max_nodes: self.phase.max_nodes.min(self.remaining),
+            ..self.phase
+        }
+    }
+
+    fn charge(&mut self, used: usize) -> Result<(), ComputedFieldError> {
+        self.remaining = self
+            .remaining
+            .checked_sub(used)
+            .ok_or(ComputedFieldError::ResourceLimit)?;
+        Ok(())
+    }
+
+    fn used(&self) -> usize {
+        self.limit - self.remaining
+    }
+
+    fn with_build<T>(
+        &mut self,
+        build: &mut Build<'_>,
+        run: impl FnOnce(&mut Build<'_>) -> Result<T, ComputedFieldError>,
+    ) -> Result<T, ComputedFieldError> {
+        build.work.remaining = build.work.remaining.min(self.remaining);
+        let before = build.work.remaining;
+        let result = run(build);
+        self.charge(before - build.work.remaining)?;
+        result
+    }
 }
 
 struct Build<'a> {
@@ -573,6 +625,17 @@ pub fn implementation_family(
     kernel: Budget,
     budget: RecordBudget,
 ) -> Result<Declaration, ComputedFieldError> {
+    implementation_family_with_work(env, family, fields, kernel, budget)
+        .map(|(declaration, _)| declaration)
+}
+
+fn implementation_family_with_work(
+    env: &Environment,
+    family: &Name,
+    fields: &[Name],
+    kernel: Budget,
+    budget: RecordBudget,
+) -> Result<(Declaration, usize), ComputedFieldError> {
     let mut build = Build::new(env, kernel, budget);
     let model = profile(&mut build, family, fields)?;
     let mut constructors = Vec::new();
@@ -606,14 +669,19 @@ pub fn implementation_family(
         constructors,
         result_level: Level::one(),
     };
-    Ok(crate::inductive::inductive_with_external_constructor_names(
-        &spec,
-        &names,
-        RecordBudget {
-            max_nodes: build.work.remaining,
-            max_binders: budget.max_binders,
-        },
-    )?)
+    let (declaration, nested_work) =
+        crate::inductive::inductive_with_external_constructor_names_with_work(
+            &spec,
+            &names,
+            RecordBudget {
+                max_nodes: build.work.remaining,
+                max_binders: budget.max_binders,
+            },
+        )?;
+    let used = (budget.max_nodes - build.work.remaining)
+        .checked_add(nested_work)
+        .ok_or(ComputedFieldError::ResourceLimit)?;
+    Ok((declaration, used))
 }
 
 /// Construct replacement candidates after `_impl` and its ordinary casesOn
@@ -625,6 +693,16 @@ pub fn replacements(
     kernel: Budget,
     budget: RecordBudget,
 ) -> Result<Generated, ComputedFieldError> {
+    replacements_with_work(env, family, fields, kernel, budget).map(|(generated, _)| generated)
+}
+
+fn replacements_with_work(
+    env: &Environment,
+    family: &Name,
+    fields: &[Name],
+    kernel: Budget,
+    budget: RecordBudget,
+) -> Result<(Generated, usize), ComputedFieldError> {
     let mut build = Build::new(env, kernel, budget);
     let model = profile(&mut build, family, fields)?;
     let family_type = constant(family);
@@ -792,10 +870,13 @@ pub fn replacements(
         )?);
         edges.push((field.name.clone(), name));
     }
-    Ok(Generated {
-        declarations: definitions.into_iter().map(Declaration::Defn).collect(),
-        implemented_by: edges,
-    })
+    Ok((
+        Generated {
+            declarations: definitions.into_iter().map(Declaration::Defn).collect(),
+            implemented_by: edges,
+        },
+        budget.max_nodes - build.work.remaining,
+    ))
 }
 
 fn compare_block(build: &mut Build<'_>, block: &InductiveBlock) -> Result<(), ComputedFieldError> {
@@ -830,13 +911,38 @@ fn validate_inventory(
     kernel: Budget,
     budget: RecordBudget,
 ) -> Result<ComputedFamily, ComputedFieldError> {
-    let implementation = implementation_family(env, family, fields, kernel, budget)?;
+    validate_inventory_with_work(
+        env,
+        family,
+        fields,
+        kernel,
+        budget,
+        budget.max_nodes.saturating_mul(VALIDATION_PHASES - 1),
+    )
+    .map(|(model, _)| model)
+}
+
+fn validate_inventory_with_work(
+    env: &Environment,
+    family: &Name,
+    fields: &[Name],
+    kernel: Budget,
+    budget: RecordBudget,
+    max_work: usize,
+) -> Result<(ComputedFamily, usize), ComputedFieldError> {
+    let mut work = ValidationWork::new(budget, max_work);
+    let (implementation, used) =
+        implementation_family_with_work(env, family, fields, kernel, work.budget())?;
+    work.charge(used)?;
     let Declaration::Inductive(block) = implementation else {
         return Err(ComputedFieldError::InvalidInventory);
     };
-    let mut build = Build::new(env, kernel, budget);
-    let mut model = profile(&mut build, family, fields)?;
-    compare_block(&mut build, &block)?;
+    let mut build = Build::new(env, kernel, work.budget());
+    let mut model = work.with_build(&mut build, |build| {
+        let model = profile(build, family, fields)?;
+        compare_block(build, &block)?;
+        Ok(model)
+    })?;
     // Neither an arbitrary casesOn with a familiar name nor an altered cache
     // recursor can authorize a representation adapter.
     for name in [family, &model.implementation] {
@@ -848,11 +954,11 @@ fn validate_inventory(
         };
         // These two independent generators are phases five and six of the
         // advertised validation allowance; comparison stays in phase four.
-        let canonical = crate::inductive::auxiliaries::cases_on_declaration(
+        let (canonical, used) = crate::inductive::auxiliaries::cases_on_declaration_with_work(
             inductive,
             recursor,
             std::slice::from_ref(inductive),
-            budget,
+            work.budget(),
         )
         .map_err(|error| {
             if error == crate::inductive::auxiliaries::AuxiliaryError::ResourceLimit {
@@ -861,65 +967,74 @@ fn validate_inventory(
                 ComputedFieldError::InvalidInventory
             }
         })?;
-        build.scan_closed(&canonical.base.type_)?;
-        build.scan_closed(&canonical.value)?;
-        if env.find(&canonical.base.name) != Some(&ConstantInfo::Defn(canonical)) {
-            return Err(ComputedFieldError::InvalidInventory);
-        }
+        work.charge(used)?;
+        work.with_build(&mut build, |build| {
+            build.scan_closed(&canonical.base.type_)?;
+            build.scan_closed(&canonical.value)?;
+            if env.find(&canonical.base.name) != Some(&ConstantInfo::Defn(canonical)) {
+                return Err(ComputedFieldError::InvalidInventory);
+            }
+            Ok(())
+        })?;
     }
     // Imported membership can describe another compiler's representation.
     // Reject a different telescope or eliminator before reducing its getters;
     // only a matching checked representation needs equation regeneration.
-    let generated = replacements(env, family, fields, kernel, budget)?;
-    for declaration in generated.declarations {
-        let Declaration::Defn(definition) = declaration else {
-            return Err(ComputedFieldError::InvalidInventory);
-        };
-        build.scan_closed(&definition.base.type_)?;
-        build.scan_closed(&definition.value)?;
-        if env.find(&definition.base.name) != Some(&ConstantInfo::Defn(definition.clone())) {
-            return Err(ComputedFieldError::InvalidInventory);
-        }
-        model.overrides.push(definition);
-    }
-    let edges =
-        crate::implemented_by::ImplementedByTable::read_metered(env, |amount| build.charge(amount))
-            .map_err(|error| match error {
-                crate::implemented_by::ImplementedByReadError::Budget(error) => error,
-                crate::implemented_by::ImplementedByReadError::Registry(
-                    crate::implemented_by::ImplementedByError::Limit,
-                ) => ComputedFieldError::ResourceLimit,
-                _ => ComputedFieldError::InvalidInventory,
-            })?;
-    let externs = crate::externs::ExternTable::read_metered(env, |amount| build.charge(amount))
-        .map_err(|error| match error {
-            crate::externs::ExternReadError::Budget(error) => error,
-            crate::externs::ExternReadError::Registry(crate::externs::ExternError::Limit) => {
-                ComputedFieldError::ResourceLimit
+    let (generated, used) = replacements_with_work(env, family, fields, kernel, work.budget())?;
+    work.charge(used)?;
+    work.with_build(&mut build, |build| {
+        for declaration in generated.declarations {
+            let Declaration::Defn(definition) = declaration else {
+                return Err(ComputedFieldError::InvalidInventory);
+            };
+            build.scan_closed(&definition.base.type_)?;
+            build.scan_closed(&definition.value)?;
+            if env.find(&definition.base.name) != Some(&ConstantInfo::Defn(definition.clone())) {
+                return Err(ComputedFieldError::InvalidInventory);
             }
+            model.overrides.push(definition);
+        }
+        let edges = crate::implemented_by::ImplementedByTable::read_metered(env, |amount| {
+            build.charge(amount)
+        })
+        .map_err(|error| match error {
+            crate::implemented_by::ImplementedByReadError::Budget(error) => error,
+            crate::implemented_by::ImplementedByReadError::Registry(
+                crate::implemented_by::ImplementedByError::Limit,
+            ) => ComputedFieldError::ResourceLimit,
             _ => ComputedFieldError::InvalidInventory,
         })?;
-    for (logical, implementation) in &generated.implemented_by {
-        if edges.get(logical) != Some(implementation)
-            || edges.get(implementation).is_some()
-            || externs.get(logical).is_some()
-            || externs.get(implementation).is_some()
+        let externs = crate::externs::ExternTable::read_metered(env, |amount| build.charge(amount))
+            .map_err(|error| match error {
+                crate::externs::ExternReadError::Budget(error) => error,
+                crate::externs::ExternReadError::Registry(crate::externs::ExternError::Limit) => {
+                    ComputedFieldError::ResourceLimit
+                }
+                _ => ComputedFieldError::InvalidInventory,
+            })?;
+        for (logical, implementation) in &generated.implemented_by {
+            if edges.get(logical) != Some(implementation)
+                || edges.get(implementation).is_some()
+                || externs.get(logical).is_some()
+                || externs.get(implementation).is_some()
+            {
+                return Err(ComputedFieldError::InvalidInventory);
+            }
+        }
+        for name in model
+            .constructors
+            .iter()
+            .map(|ctor| ctor.implementation.clone())
+            .chain([
+                Name::str(model.implementation.clone(), "casesOn"),
+                Name::from_components(["unsafeCast"]),
+            ])
         {
-            return Err(ComputedFieldError::InvalidInventory);
+            if edges.get(&name).is_some() || externs.get(&name).is_some() {
+                return Err(ComputedFieldError::InvalidInventory);
+            }
         }
-    }
-    for name in model
-        .constructors
-        .iter()
-        .map(|ctor| ctor.implementation.clone())
-        .chain([
-            Name::str(model.implementation.clone(), "casesOn"),
-            Name::from_components(["unsafeCast"]),
-        ])
-    {
-        if edges.get(&name).is_some() || externs.get(&name).is_some() {
-            return Err(ComputedFieldError::InvalidInventory);
-        }
-    }
-    Ok(model)
+        Ok(())
+    })?;
+    Ok((model, work.used()))
 }

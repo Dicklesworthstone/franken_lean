@@ -218,11 +218,13 @@ pub fn inductive_declaration(
 /// Computed-field implementation types keep constructor names below the
 /// original logical constructors, outside the generated family's namespace.
 /// This changes names only; both checking engines still reconstruct the block.
-pub(crate) fn inductive_with_external_constructor_names(
+/// Preserve the single generation allowance while reporting both the external
+/// name validation and the nested inductive builder's actual consumption.
+pub(crate) fn inductive_with_external_constructor_names_with_work(
     spec: &InductiveSpec,
     names: &[Name],
     budget: RecordBudget,
-) -> Result<Declaration, InductiveError> {
+) -> Result<(Declaration, usize), InductiveError> {
     if names.len() != spec.constructors.len() {
         return Err(InductiveError::InvalidName);
     }
@@ -243,7 +245,7 @@ pub(crate) fn inductive_with_external_constructor_names(
             parent = parent.parent();
         }
     }
-    build_inductive(
+    let (declaration, used) = build_inductive_with_work(
         spec,
         RecordBudget {
             max_nodes: remaining,
@@ -252,7 +254,11 @@ pub(crate) fn inductive_with_external_constructor_names(
         None,
         None,
         Some(names),
-    )
+    )?;
+    let used = (budget.max_nodes - remaining)
+        .checked_add(used)
+        .ok_or(InductiveError::ResourceLimit)?;
+    Ok((declaration, used))
 }
 
 /// Field universes inform candidate generation only. Both admission engines
@@ -289,6 +295,23 @@ fn build_inductive(
     promoted: Option<&[Vec<LocalDecl>]>,
     external_constructor_names: Option<&[Name]>,
 ) -> Result<Declaration, InductiveError> {
+    build_inductive_with_work(
+        spec,
+        budget,
+        field_universes,
+        promoted,
+        external_constructor_names,
+    )
+    .map(|(declaration, _)| declaration)
+}
+
+fn build_inductive_with_work(
+    spec: &InductiveSpec,
+    budget: RecordBudget,
+    field_universes: Option<&[Vec<Level>]>,
+    promoted: Option<&[Vec<LocalDecl>]>,
+    external_constructor_names: Option<&[Name]>,
+) -> Result<(Declaration, usize), InductiveError> {
     if spec.name.is_anonymous() {
         return Err(InductiveError::InvalidName);
     }
@@ -609,7 +632,7 @@ fn build_inductive(
         false,
         false,
     )?;
-    Ok(Declaration::Inductive(InductiveBlock {
+    let declaration = Declaration::Inductive(InductiveBlock {
         types: vec![InductiveVal {
             base: ConstantVal {
                 name: spec.name.clone(),
@@ -645,5 +668,8 @@ fn build_inductive(
             k: k_target,
             is_unsafe: false,
         }],
-    }))
+    });
+    // The final family telescope above still calls `close`; include it before
+    // observing the counter, just like constructor and recursor generation.
+    Ok((declaration, budget.max_nodes - builder.remaining))
 }

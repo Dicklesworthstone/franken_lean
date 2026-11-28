@@ -286,6 +286,18 @@ pub fn cases_on_declaration(
     families: &[InductiveVal],
     budget: RecordBudget,
 ) -> Result<DefinitionVal, AuxiliaryError> {
+    cases_on_declaration_with_work(inductive, recursor, families, budget)
+        .map(|(declaration, _)| declaration)
+}
+
+/// Report the same bounded generation, including `finish`'s closing and closed
+/// expression scans, without changing the public candidate-generation API.
+pub(crate) fn cases_on_declaration_with_work(
+    inductive: &InductiveVal,
+    recursor: &RecursorVal,
+    families: &[InductiveVal],
+    budget: RecordBudget,
+) -> Result<(DefinitionVal, usize), AuxiliaryError> {
     let family = family_name(recursor)?;
     if families.len() > budget.max_binders {
         return Err(AuxiliaryError::ResourceLimit);
@@ -417,11 +429,12 @@ pub fn cases_on_declaration(
         ),
         arguments,
     );
-    build.finish(
+    let declaration = build.finish(
         recursor,
         Name::str(family, "casesOn"),
         &params,
         result,
         value,
-    )
+    )?;
+    Ok((declaration, budget.max_nodes - build.work.remaining))
 }

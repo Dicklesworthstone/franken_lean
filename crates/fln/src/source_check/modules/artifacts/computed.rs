@@ -52,19 +52,17 @@ fn reduction_failed(module: &Name, error: Box<UnificationError>) -> SourceModule
     }
 }
 
-fn budget(
-    meter: &mut Meter,
-    phases: usize,
-    remaining_models: usize,
-) -> Result<RecordBudget, SourceModuleCheckError> {
+// Keep the existing phase ceilings and allocation policy. The metered helpers
+// below additionally enforce the aggregate remaining allowance, then report
+// the work performed instead of charging every unused phase ceiling.
+fn budget(meter: &Meter, phases: usize, remaining_models: usize) -> RecordBudget {
     let remaining = meter.limits.max_work.saturating_sub(meter.work);
     let divisor = phases.saturating_mul(remaining_models).saturating_add(1);
     let allowance = (remaining / divisor).min(100_000);
-    meter.work(allowance.saturating_mul(phases))?;
-    Ok(RecordBudget {
+    RecordBudget {
         max_binders: allowance,
         max_nodes: allowance,
-    })
+    }
 }
 
 pub(super) fn models(
@@ -86,8 +84,9 @@ pub(super) fn models(
         meter.bytes(entry.payload.len())?;
         unchanged &= prior.next() == Some(entry);
     }
-    let claims = computed_fields::families(private, budget(meter, 1, 1)?)
+    let (claims, work) = computed_fields::families_with_work(private, budget(meter, 1, 1))
         .map_err(|failure| failed(module, meter, failure))?;
+    meter.work(work)?;
     let visible_family = claims.first().cloned();
     if unchanged {
         return Ok(Captured {
@@ -117,15 +116,19 @@ pub(super) fn models(
             meter,
             computed_fields::VALIDATION_PHASES,
             owned.len() - index,
-        )?;
-        let model = computed_fields::validated_family(
+        );
+        let remaining = meter.limits.max_work.saturating_sub(meter.work);
+        let (model, work) = computed_fields::validated_family_with_work(
             private,
             family,
             meter.limits.source.admission.kernel,
             budget,
+            remaining,
         )
-        .map_err(|failure| failed(module, meter, failure))?
-        .ok_or_else(|| error(module, "computed-field generation provenance disappeared"))?;
+        .map_err(|failure| failed(module, meter, failure))?;
+        meter.work(work)?;
+        let model = model
+            .ok_or_else(|| error(module, "computed-field generation provenance disappeared"))?;
         let Some(ConstantInfo::Induct(original)) = private.find(&model.family) else {
             return Err(error(
                 module,
@@ -300,33 +303,46 @@ fn word_bound(
         64 => NatLit::from_limbs_le(vec![0, 1]),
         _ => return Err(invalid()),
     };
-    let allowance = budget(meter, 2, remaining_words.saturating_add(1))?.max_nodes;
-    let mut reduction = UnificationBudget::new(meter.limits.source.admission.kernel);
-    reduction.transparency = UnificationTransparency::SafeDefinitions;
-    reduction.max_steps = reduction.max_steps.min(allowance as u64);
-    reduction.max_visited_nodes = reduction.max_visited_nodes.min(allowance);
+    let allowance = budget(meter, 2, remaining_words.saturating_add(1)).max_nodes;
     let mut transaction = fln_elab::ElabTxn::new(private.clone(), KVMap::new(), 0);
-    let work_limit = meter.limits.max_work;
-    let reduce = |transaction: &mut fln_elab::ElabTxn, expression: &Expr| {
+    let reduce = |transaction: &mut fln_elab::ElabTxn, expression: &Expr, meter: &mut Meter| {
+        let allowance = allowance.min(meter.limits.max_work.saturating_sub(meter.work));
+        let mut reduction = UnificationBudget::new(meter.limits.source.admission.kernel);
+        reduction.transparency = UnificationTransparency::SafeDefinitions;
+        reduction.max_steps = reduction.max_steps.min(allowance as u64);
+        reduction.max_visited_nodes = reduction.max_visited_nodes.min(allowance);
+        let before = transaction.budget.heartbeats_consumed;
         transaction.budget.max_heartbeats = transaction
             .budget
             .heartbeats_consumed
             .saturating_add(allowance as u64);
         let locals = transaction.lctx.clone();
-        transaction
-            .whnf_with(expression, &locals, reduction)
-            .map_err(|failure| match failure {
-                UnificationError::StepLimit { .. }
-                | UnificationError::NodeLimit { .. }
-                | UnificationError::AssignmentLimit { .. }
-                | UnificationError::HeartbeatLimit => SourceModuleCheckError::Limit {
-                    resource: "module work",
-                    limit: work_limit,
-                },
-                other => reduction_failed(module, Box::new(other)),
-            })
+        let result = transaction.whnf_with(expression, &locals, reduction);
+        let used = transaction
+            .budget
+            .heartbeats_consumed
+            .saturating_sub(before);
+        // The reducer charges every visited node through its step counter.
+        // Retain the old step/node ceilings, and charge the actual work before
+        // inspecting success or continuing with the second checked reduction.
+        meter.work(
+            usize::try_from(used).map_err(|_| SourceModuleCheckError::Limit {
+                resource: "module work",
+                limit: meter.limits.max_work,
+            })?,
+        )?;
+        result.map_err(|failure| match failure {
+            UnificationError::StepLimit { .. }
+            | UnificationError::NodeLimit { .. }
+            | UnificationError::AssignmentLimit { .. }
+            | UnificationError::HeartbeatLimit => SourceModuleCheckError::Limit {
+                resource: "module work",
+                limit: meter.limits.max_work,
+            },
+            other => reduction_failed(module, Box::new(other)),
+        })
     };
-    let reduced = reduce(&mut transaction, &bound)?;
+    let reduced = reduce(&mut transaction, &bound, meter)?;
     if !matches!(without_metadata(&reduced, meter)?.node(), ExprNode::Lit { literal: Literal::Nat(value) }
         if value == &expected_bound)
     {
@@ -371,7 +387,7 @@ fn word_bound(
     let bound = Expr::fvar(bound_id);
     let value = Expr::fvar(value_id);
     let proof = instantiate_word_model(module, proof, &[bound.clone(), value.clone()], meter)?;
-    let reduced = reduce(&mut transaction, &proof)?;
+    let reduced = reduce(&mut transaction, &proof, meter)?;
     let expected = Expr::app(
         Expr::app(
             Expr::const_(Name::from_components(["Nat", "le"]), Vec::new()),

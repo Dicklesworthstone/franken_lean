@@ -12,6 +12,9 @@ use std::collections::BTreeSet;
 #[path = "source_computed_field_artifacts/pin.rs"]
 mod pin;
 
+#[path = "source_computed_field_artifacts/work.rs"]
+mod work;
+
 const STACK: usize = 16 << 20;
 const CAST: &str = "unsafe axiom unsafeCast.{u, v} {A : Sort u} {B : Sort v} (a : A) : B\n";
 const PRIMITIVES: &str = "inductive PUnit where | unit\ninductive Bool where | false | true\n";
