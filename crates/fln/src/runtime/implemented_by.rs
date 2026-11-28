@@ -97,6 +97,13 @@ impl Preparation<'_> {
         {
             return Ok(false);
         }
+        // Native source computed fields carry a regenerated implementation
+        // inventory and an augmented physical layout. Preserve the historical
+        // complete-pin logical adapter only for imported Name worlds without
+        // that native provenance.
+        if self.native_computed_operation(requested)? {
+            return Ok(false);
+        }
         let expected = Name::str(requested.clone(), "_override");
         if self.implementations()?.get(requested) != Some(&expected) {
             return Ok(false);

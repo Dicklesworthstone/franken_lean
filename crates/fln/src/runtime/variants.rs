@@ -102,7 +102,11 @@ impl Preparation<'_> {
                     body,
                     ctor,
                     field,
-                    Expr::proj(shape.projection(ctor), field as u64, major.clone()),
+                    Expr::proj(
+                        shape.projection(ctor),
+                        ctor.physical_field(field),
+                        major.clone(),
+                    ),
                 )?;
             }
             reserve(&mut branches, self.limits.max_lambda_bindings)?;

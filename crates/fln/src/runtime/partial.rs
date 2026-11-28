@@ -102,6 +102,9 @@ impl Preparation<'_> {
             {
                 return Ok(None);
             }
+            if let Some(definition) = self.computed_override_definition(requested)? {
+                return Ok(Some(definition));
+            }
             return Ok((!self
                 .runtime_initializers
                 .is_some_and(|names| names.contains(requested)))

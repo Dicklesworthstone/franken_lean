@@ -489,11 +489,17 @@ impl Preparation<'_> {
                 if a.original != e.original
                     || a.tag != e.tag
                     || a.fields.len() != e.fields.len()
+                    || a.cached_fields.len() != e.cached_fields.len()
                     || a.type_fields != e.type_fields
                 {
                     return Ok(false);
                 }
-                for (a, e) in a.fields.iter().zip(&e.fields) {
+                for (a, e) in a
+                    .cached_fields
+                    .iter()
+                    .chain(&a.fields)
+                    .zip(e.cached_fields.iter().chain(&e.fields))
+                {
                     self.tick()?;
                     reserve(&mut work, self.limits.max_nodes)?;
                     work.push((a.clone(), e.clone()));

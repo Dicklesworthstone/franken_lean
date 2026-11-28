@@ -266,7 +266,8 @@ pub(super) fn elaborate(
             Some(EvaluationResultPresentation::Guard),
         )));
     }
-    let mut preparation = runtime::Preparation::new(engine.environment(), limits.ingress);
+    let mut preparation = runtime::Preparation::new(engine.environment(), limits.ingress)
+        .with_kernel_budget(limits.kernel);
     let action = preparation
         .evaluation_presentation_type(prepared.type_())
         .map_err(EngineExecutionError::Ingress)?;

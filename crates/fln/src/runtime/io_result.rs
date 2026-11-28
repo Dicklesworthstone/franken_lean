@@ -172,6 +172,7 @@ impl Preparation<'_> {
                     tag: 0,
                     type_fields: vec![false; fields.len()],
                     fields,
+                    cached_fields: Vec::new(),
                 }],
             },
         );

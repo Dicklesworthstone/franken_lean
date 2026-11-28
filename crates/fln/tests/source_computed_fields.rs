@@ -1,0 +1,702 @@
+//! Computed fields retain checked logical equations and execute cached layouts.
+//!
+//! The exact SUITE.lock executable is an independent test oracle only. Native
+//! source admission and bytecode execution never invoke it. Prelude import has
+//! a separate large-stack budget; all new source runs use the ordinary 2 MiB
+//! kernel budget.
+#![forbid(unsafe_code)]
+
+use fln::source_check::modules::imported::{SourceOleanImport, SourceOleanImportLimits};
+use fln::source_check::modules::{
+    SourceModuleBuildError, SourceModuleCheckError, SourceModuleCheckLimits,
+};
+use fln::{
+    Budget, Engine, EngineAdmissionLimits, EngineExecutionLimits, Environment, KVMap, Name,
+    OleanCheckLimits, OleanModuleInput, OleanWriteBudget, SourceCheckLimits, SourceModuleInput,
+    VmExit,
+};
+use fln_comp::flbc::{
+    CallableResultOwnership, Function, FunctionId, Instruction, Program, Register, ValidatedProgram,
+};
+use fln_core::expr::{BinderInfo, Expr, ExprNode};
+use fln_elab::implemented_by::ImplementedByTable;
+use fln_env::constants::{ConstantInfo, DefinitionSafety};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicUsize, Ordering},
+};
+
+const IMPORT_STACK: usize = 64 * 1024 * 1024;
+const SOURCE_STACK: usize = 2 * 1024 * 1024;
+const SINGLE: &str = r#"
+inductive Cache where
+  | empty
+  | add (n : Nat) (tail : Cache)
+with
+  @[computed_field, inline] total : Cache → Nat
+    | .empty => 0
+    | .add n tail => Nat.add n tail.total
+"#;
+const CROSS: &str = r#"
+inductive Cross where
+  | empty
+  | add (n : Nat) (tail : Cross)
+with
+  @[computed_field, inline] first : Cross → Nat
+    | .empty => 0
+    | .add n tail => Nat.add n tail.second
+  @[computed_field] second : Cross → Nat
+    | .empty => 0
+    | .add n tail => Nat.add (Nat.add n tail.first) 10
+"#;
+const WORD: &str = r#"
+inductive Digest where
+  | empty
+  | add (n : UInt64) (tail : Digest)
+with
+  @[computed_field, inline] hash : Digest → UInt64
+    | .empty => UInt64.ofNatLT 1 (of_decide_eq_true rfl)
+    | .add n tail => mixHash tail.hash n
+"#;
+
+fn name(text: &str) -> Name {
+    Name::from_components(text.split('.'))
+}
+fn limits() -> EngineExecutionLimits {
+    EngineExecutionLimits::new(Budget::for_stack_bytes(SOURCE_STACK))
+}
+fn check_limits() -> SourceCheckLimits {
+    SourceCheckLimits::new(EngineAdmissionLimits::new(limits().kernel))
+}
+
+struct Fixture {
+    imported: SourceOleanImport,
+    compiler: PathBuf,
+}
+
+fn with_fixture(test: impl FnOnce(&Fixture) + Send + 'static) {
+    std::thread::Builder::new()
+        .stack_size(IMPORT_STACK)
+        .spawn(move || {
+            static FIXTURE: OnceLock<Option<Fixture>> = OnceLock::new();
+            let fixture = FIXTURE.get_or_init(|| {
+                let library = std::env::var_os("FLN_REFERENCE_LIB")
+                    .map(PathBuf::from)
+                    .or_else(|| {
+                        std::env::var_os("HOME").map(|home| {
+                            PathBuf::from(home)
+                                .join(".elan/toolchains/leanprover--lean4---v4.32.0/lib/lean")
+                        })
+                    })
+                    .filter(|path| path.join("Init/Prelude.olean").is_file());
+                let Some(library) = library else {
+                    assert!(
+                        std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+                        "computed-field tests require the exact pinned Reference library"
+                    );
+                    eprintln!("SKIP: pinned Reference library absent");
+                    return None;
+                };
+                let compiler = std::env::var_os("FLN_REFERENCE_LEAN")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| {
+                        library.parent().unwrap().parent().unwrap().join("bin/lean")
+                    });
+                let commit = Command::new(&compiler).arg("--githash").output().unwrap();
+                assert!(commit.status.success());
+                assert_eq!(
+                    String::from_utf8(commit.stdout).unwrap().trim(),
+                    fln::OLEAN_PIN_COMMIT,
+                    "the test oracle must match SUITE.lock exactly"
+                );
+                let path = library.join("Init/Prelude.olean");
+                let parts = [
+                    std::fs::read(&path).unwrap(),
+                    std::fs::read(path.with_extension("olean.server")).unwrap(),
+                    std::fs::read(path.with_extension("olean.private")).unwrap(),
+                ];
+                let module = name("Init.Prelude");
+                let inputs = [OleanModuleInput {
+                    name: &module,
+                    artifact: &parts[0],
+                    server_artifact: Some(&parts[1]),
+                    private_artifact: Some(&parts[2]),
+                }];
+                let imported = Engine::builder()
+                    .build_empty()
+                    .import_olean_modules_for_source(
+                        &inputs,
+                        std::slice::from_ref(&module),
+                        &KVMap::new(),
+                        SourceOleanImportLimits::new(OleanCheckLimits::new(
+                            IMPORT_STACK,
+                            Budget::for_stack_bytes(IMPORT_STACK),
+                        )),
+                    )
+                    .expect("the original pinned Prelude passes checked import")
+                    .into_complete()
+                    .expect("checked Prelude import completes within its separate import budget");
+                Some(Fixture { imported, compiler })
+            });
+            if let Some(fixture) = fixture {
+                test(fixture);
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn reference(compiler: &Path, source: &str, expected: Option<&str>) -> String {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let directory =
+        std::env::temp_dir().join(format!("fln-computed-fields-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join(format!("{}.lean", NEXT.fetch_add(1, Ordering::Relaxed)));
+    std::fs::write(&path, source).unwrap();
+    let output = Command::new(compiler)
+        .arg("-j1")
+        .arg(&path)
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if let Some(expected) = expected {
+        assert!(output.status.success(), "{source}\n{text}");
+        assert_eq!(text.trim(), expected, "{source}");
+    } else {
+        assert!(
+            !output.status.success(),
+            "the pin unexpectedly accepted {source}\n{text}"
+        );
+    }
+    text
+}
+
+fn checked(engine: &Engine, source: &str) -> Engine {
+    engine
+        .check_source_files(&[source.as_bytes()], &KVMap::new(), check_limits())
+        .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
+        .into_complete()
+        .expect("computed-field source completes with the ordinary source budget")
+        .engine
+}
+
+fn execute(engine: &Engine, source: &str, expected: &[&str]) -> Vec<Vec<u8>> {
+    let options = KVMap::new();
+    let before = engine.logical_root(&options);
+    let report = engine
+        .execute_source_definitions(&[source.as_bytes()], &options, limits())
+        .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
+        .into_complete()
+        .expect("computed-field execution completes with ordinary source and VM budgets");
+    assert_eq!(report.executions.len(), expected.len());
+    let mut artifacts = Vec::new();
+    for (execution, expected) in report.executions.iter().zip(expected) {
+        let VmExit::Returned(returned) = &execution.exit else {
+            panic!(
+                "computed-field execution did not return: {:?}",
+                execution.exit
+            );
+        };
+        assert_eq!(
+            fln::nat_decimal(&returned.value).as_deref(),
+            Some(*expected)
+        );
+        let replay =
+            fln::execute_flbc_artifact(&execution.flbc_artifact, &options, Default::default())
+                .expect("the native computed-field artifact validates")
+                .into_complete()
+                .expect("computed-field bytecode replays without a source environment");
+        let VmExit::Returned(returned) = replay else {
+            panic!("computed-field bytecode replay did not return");
+        };
+        assert_eq!(
+            fln::nat_decimal(&returned.value).as_deref(),
+            Some(*expected)
+        );
+        artifacts.push(execution.flbc_artifact.clone());
+    }
+    assert_eq!(engine.logical_root(&options), before);
+    artifacts
+}
+
+fn mentions(expression: &Expr, requested: &Name) -> bool {
+    let mut pending = vec![expression];
+    while let Some(expression) = pending.pop() {
+        match expression.node() {
+            ExprNode::Const { name, .. } if name == requested => return true,
+            ExprNode::App { f, a } => pending.extend([f, a]),
+            ExprNode::Lam {
+                binder_type, body, ..
+            }
+            | ExprNode::ForallE {
+                binder_type, body, ..
+            } => pending.extend([binder_type, body]),
+            ExprNode::LetE {
+                type_, value, body, ..
+            } => pending.extend([type_, value, body]),
+            ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => pending.push(expr),
+            _ => {}
+        }
+    }
+    false
+}
+
+fn cache_read(instruction: &Instruction) -> bool {
+    matches!(
+        instruction,
+        Instruction::CtorField {
+            expected_tag: 1,
+            expected_fields: 3,
+            field: 0,
+            ..
+        }
+    )
+}
+
+fn execute_stored_cache_control(bytecode: &ValidatedProgram) {
+    let getter = bytecode
+        .functions()
+        .iter()
+        .find(|function| {
+            function.arity == 1
+                && function.result_ownership == CallableResultOwnership::OwnedOrScalar
+                && function.code.iter().any(cache_read)
+        })
+        .expect("generated Nat getter has an executable cached projection");
+    let mut functions = bytecode.functions().to_vec();
+    let entry = FunctionId::new(u32::try_from(functions.len()).unwrap());
+    let r = Register::new;
+    functions.push(Function {
+        id: entry,
+        arity: 0,
+        parameter_ownership: Vec::new(),
+        register_count: 5,
+        result_ownership: CallableResultOwnership::OwnedOrScalar,
+        code: vec![
+            Instruction::Nat {
+                dst: r(0),
+                value: 99,
+            },
+            Instruction::Nat {
+                dst: r(1),
+                value: 2,
+            },
+            Instruction::Nat {
+                dst: r(2),
+                value: 0,
+            },
+            Instruction::Ctor {
+                dst: r(3),
+                tag: 1,
+                fields: vec![r(0), r(1), r(2)],
+                scalar_bytes: Vec::new(),
+            },
+            Instruction::Call {
+                dst: r(4),
+                function: getter.id,
+                args: vec![r(3)],
+                argument_ownership: getter.parameter_ownership.clone(),
+                result_ownership: getter.result_ownership,
+            },
+            Instruction::Return { src: r(4) },
+        ],
+    });
+    // This representation control stays below source elaboration and grants
+    // no unsafeCast primitive or environment authority.
+    let controlled = fln_comp::flbc::validate(Program::new(entry, functions)).unwrap();
+    let bytes = fln_comp::flbc::encode_canonical(&controlled, Default::default()).unwrap();
+    let result = fln::execute_flbc_artifact(&bytes, &KVMap::new(), Default::default())
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let VmExit::Returned(value) = result else {
+        panic!("stored-cache control did not return");
+    };
+    assert_eq!(
+        fln::nat_decimal(&value.value).as_deref(),
+        Some("99"),
+        "getter must return stored cache99, not recompute payload2"
+    );
+}
+
+fn assert_generated(engine: &Engine, family: &str, constructor: &str, fields: &[&str], count: u32) {
+    let logical = format!("{family}.{constructor}");
+    let implementation = format!("{logical}._impl");
+    let Some(ConstantInfo::Ctor(original)) = engine.environment().find(&name(&logical)) else {
+        panic!("missing logical constructor {logical}");
+    };
+    let Some(ConstantInfo::Ctor(cached)) = engine.environment().find(&name(&implementation)) else {
+        panic!("missing generated constructor {implementation}");
+    };
+    assert_eq!(cached.num_fields, original.num_fields + count);
+    assert_eq!(cached.induct, name(&format!("{family}._impl")));
+    let Some(ConstantInfo::Defn(constructor_override)) = engine
+        .environment()
+        .find(&name(&format!("{logical}._override")))
+    else {
+        panic!("missing cached constructor override");
+    };
+    for field in fields {
+        assert!(
+            mentions(
+                &constructor_override.value,
+                &name(&format!("{family}.{field}"))
+            ),
+            "constructor cache construction must read the child's {field} cache without unfolding its logical recursion"
+        );
+    }
+    let replacements = ImplementedByTable::read(engine.environment()).unwrap();
+    for operation in std::iter::once(logical)
+        .chain(std::iter::once(format!("{family}.casesOn")))
+        .chain(fields.iter().map(|field| format!("{family}.{field}")))
+    {
+        let target = format!("{operation}._override");
+        assert_eq!(replacements.get(&name(&operation)), Some(&name(&target)));
+        let Some(ConstantInfo::Defn(definition)) = engine.environment().find(&name(&target)) else {
+            panic!("missing generated executable definition {target}");
+        };
+        assert_eq!(definition.safety, DefinitionSafety::Unsafe);
+        assert!(!definition.value.has_fvar());
+        assert!(!definition.value.has_expr_mvar());
+        assert!(!definition.value.has_level_mvar());
+        assert!(!definition.value.has_loose_bvars());
+    }
+    for field in fields {
+        let getter = format!("{family}.{field}");
+        let Some(ConstantInfo::Defn(definition)) = engine.environment().find(&name(&getter)) else {
+            panic!("missing checked logical definition {getter}");
+        };
+        assert_eq!(definition.safety, DefinitionSafety::Safe);
+        assert!(
+            !engine
+                .environment()
+                .contains(&name(&format!("{getter}._unsafe_rec")))
+        );
+    }
+}
+
+#[test]
+fn recursive_fields_preserve_logical_equations_aliases_and_cached_bytecode() {
+    with_fixture(|fixture| {
+        let source = format!(
+            r#"{SINGLE}
+def sample : Cache := .add 2 (.add 3 .empty)
+theorem empty_equation : Eq Cache.empty.total 0 := rfl
+theorem add_equation (n : Nat) (tail : Cache) :
+    Eq (Cache.add n tail).total (Nat.add n tail.total) := rfl
+theorem sample_equation : Eq sample.total 5 := rfl
+abbrev CacheAlias := Cache
+def retain (value : CacheAlias) : CacheAlias := value
+def observe (value : CacheAlias) : Nat := match value with
+  | .empty => 0
+  | .add n tail => Nat.add n tail.total
+"#
+        );
+        let evaluations = "#eval sample.total\n#eval (retain sample).total\n#eval observe (retain sample)\n#eval Cache.empty.total\n";
+        reference(
+            &fixture.compiler,
+            &format!("{source}{evaluations}"),
+            Some("5\n5\n5\n0"),
+        );
+        let engine = checked(&fixture.imported.engine, &source);
+        assert_generated(&engine, "Cache", "add", &["total"], 1);
+        let artifacts = execute(&engine, evaluations, &["5", "5", "5", "0"]);
+        assert_eq!(
+            artifacts,
+            execute(&engine, evaluations, &["5", "5", "5", "0"])
+        );
+        let bytecode = fln_comp::flbc::decode_canonical(&artifacts[0], Default::default()).unwrap();
+        execute_stored_cache_control(&bytecode);
+        assert!(bytecode.functions().iter().flat_map(|function| &function.code).any(|instruction| {
+            matches!(instruction, Instruction::Ctor { tag: 1, fields, .. } if fields.len() == 3)
+                || matches!(instruction, Instruction::CtorPacked { tag: 1, fields, .. } if fields.len() == 3)
+        }), "runtime constructors must carry the computed cache as their third object field");
+        assert!(
+            bytecode
+                .functions()
+                .iter()
+                .flat_map(|function| &function.code)
+                .any(|instruction| {
+                    matches!(
+                        instruction,
+                        Instruction::CtorField {
+                            expected_tag: 1,
+                            expected_fields: 3,
+                            field: 0,
+                            ..
+                        }
+                    )
+                }),
+            "the generated getter must read the stored first field of the cached representation"
+        );
+        assert!(
+            !fixture
+                .imported
+                .engine
+                .environment()
+                .contains(&name("Cache"))
+        );
+    });
+}
+
+#[test]
+fn mutually_recursive_fields_and_word_caches_execute_and_replay() {
+    with_fixture(|fixture| {
+        let cross = format!(
+            r#"{CROSS}
+def sample : Cross := .add 2 (.add 3 (.add 4 .empty))
+theorem first_equation : Eq sample.first 19 := rfl
+theorem second_equation : Eq sample.second 29 := rfl
+"#
+        );
+        let evaluations = "#eval sample.first\n#eval sample.second\n";
+        reference(
+            &fixture.compiler,
+            &format!("{cross}{evaluations}"),
+            Some("19\n29"),
+        );
+        let engine = checked(&fixture.imported.engine, &cross);
+        assert_generated(&engine, "Cross", "add", &["first", "second"], 2);
+        execute(&engine, evaluations, &["19", "29"]);
+
+        let word = format!(
+            r#"{WORD}
+def sample : Digest := .add (UInt64.ofNatLT 2 (of_decide_eq_true rfl))
+  (.add (UInt64.ofNatLT 3 (of_decide_eq_true rfl)) .empty)
+"#
+        );
+        let evaluations = "#eval BitVec.toNat (UInt64.toBitVec sample.hash)\n#eval BitVec.toNat (UInt64.toBitVec Digest.empty.hash)\n";
+        reference(
+            &fixture.compiler,
+            &format!("{word}{evaluations}"),
+            Some("5467619628213459297\n1"),
+        );
+        let engine = checked(&fixture.imported.engine, &word);
+        assert_generated(&engine, "Digest", "add", &["hash"], 1);
+        // Native Golem keeps imported UInt64 as its checked record carrier;
+        // only the hash primitive uses a scalar. The family still adds a real
+        // cached field, independent of the future pinned module IR layout.
+        let artifacts = execute(&engine, evaluations, &["5467619628213459297", "1"]);
+        let bytecode = fln_comp::flbc::decode_canonical(&artifacts[0], Default::default()).unwrap();
+        assert!(bytecode.functions().iter().flat_map(|function| &function.code).any(|instruction| {
+            matches!(instruction, Instruction::Ctor { tag: 1, fields, .. } if fields.len() == 3)
+        }), "cached UInt64 values must occupy the augmented native record representation");
+    });
+}
+
+#[test]
+fn invalid_fields_refuse_the_whole_family_without_publishing_a_partial_world() {
+    with_fixture(|fixture| {
+        let cases = [
+            (
+                "one constructor",
+                "inductive Bad where | mk (n : Nat)\nwith\n  @[computed_field] total : Bad → Nat\n    | .mk n => n\n",
+                "at least two constructors",
+            ),
+            (
+                "missing attribute",
+                "inductive Bad where | left | right\nwith\n  total : Bad → Nat\n    | .left => 0\n    | .right => 1\n",
+                "must be tagged",
+            ),
+            (
+                "outside attribute",
+                "@[computed_field] def bad (n : Nat) : Nat := n\n",
+                "computed_field",
+            ),
+            (
+                "major dependence",
+                "inductive Bad where | left | right\nwith\n  @[computed_field] same : (x : Bad) → Eq x x\n    | .left => rfl\n    | .right => rfl\n",
+                "must not depend on value",
+            ),
+            (
+                "index dependence",
+                "inductive Bad : Bool → Type where\n  | left : Bad false\n  | right : Bad true\nwith\n  @[computed_field] same : (b : Bool) → Bad b → Eq b b\n    | _, .left => rfl\n    | _, .right => rfl\n",
+                "must not depend on indices",
+            ),
+            (
+                "irreducible constructor result",
+                "opaque opaqueScore {A : Type} (_ : A) : Nat := 0\ninductive Bad where\n  | empty\n  | value (n : Nat)\nwith\n  @[computed_field] total : Bad → Nat\n    | .empty => opaqueScore Bad.empty\n    | .value n => opaqueScore (Bad.value n)\n",
+                "does not reduce for constructor",
+            ),
+            (
+                "invalid unused field",
+                "inductive Bad where | empty | value (n : Nat)\nwith\n  @[computed_field] total : Bad → Nat\n    | .empty => 0\n    | .value n => n\n  @[computed_field] invalid : Bad → Bool\n    | .empty => Nat.zero\n    | .value _ => true\n",
+                "Type mismatch",
+            ),
+            (
+                "unknown attribute",
+                "inductive Bad where | left | right\nwith\n  @[computed_field, no_such_computed_attribute] total : Bad → Nat\n    | .left => 0\n    | .right => 1\n",
+                "Unknown attribute",
+            ),
+        ];
+        let engine = &fixture.imported.engine;
+        let options = KVMap::new();
+        let before = engine.logical_root(&options);
+        for (label, source, diagnostic) in cases {
+            let output = reference(&fixture.compiler, source, None);
+            assert!(
+                output.contains(diagnostic),
+                "wrong pin boundary for {label}: {output}"
+            );
+            let error = engine
+                .check_source_files(&[source.as_bytes()], &options, check_limits())
+                .expect_err(label);
+            assert!(
+                matches!(error.disposition(), ("elaboration" | "input", false, 1))
+                    || (matches!(label, "one constructor" | "index dependence")
+                        && error.disposition() == ("capability", false, 5)),
+                "{label}: {error:?}"
+            );
+            assert_eq!(engine.logical_root(&options), before, "{label}");
+            for unpublished in [
+                "Bad",
+                "Bad._impl",
+                "Bad.total",
+                "Bad.invalid",
+                "Bad.total._override",
+                "bad",
+            ] {
+                assert!(
+                    !engine.environment().contains(&name(unpublished)),
+                    "{label}: {unpublished}"
+                );
+            }
+        }
+        let retry = checked(engine, SINGLE);
+        assert_generated(&retry, "Cache", "add", &["total"], 1);
+        assert_eq!(engine.logical_root(&options), before);
+    });
+}
+
+#[test]
+fn generated_cache_provenance_does_not_authorize_user_written_unsafe_casts() {
+    with_fixture(|fixture| {
+        let source = format!(
+            r#"{SINGLE}
+unsafe def injected : Cache := unsafeCast (Cache.add._impl 99 2 Cache.empty)
+#eval injected.total
+"#
+        );
+        // The pin confirms that a getter reads the stored cache, even when an
+        // explicitly unsafe client fabricates an inconsistent representation.
+        reference(&fixture.compiler, &source, Some("99"));
+        let before = fixture.imported.engine.logical_root(&KVMap::new());
+        let error = fixture
+            .imported
+            .engine
+            .execute_source_definitions(&[source.as_bytes()], &KVMap::new(), limits())
+            .expect_err("native cached-field provenance does not grant arbitrary cast authority");
+        let diagnostic = format!("{error:?}");
+        assert!(
+            diagnostic.contains("unsafeCast")
+                || diagnostic.to_ascii_lowercase().contains("unsupported"),
+            "{diagnostic}"
+        );
+        assert_eq!(fixture.imported.engine.logical_root(&KVMap::new()), before);
+    });
+}
+
+#[test]
+fn generated_inventory_refuses_changed_override_and_constructor_layout() {
+    with_fixture(|fixture| {
+        let engine = checked(&fixture.imported.engine, SINGLE);
+        let original = engine.environment();
+        let Some(ConstantInfo::Defn(mut altered_body)) =
+            original.find(&name("Cache.add._override")).cloned()
+        else {
+            panic!("generated constructor override");
+        };
+        // Even a type-correct identity wrapper changes the generated body and
+        // must not inherit its authority merely by keeping the same name.
+        altered_body.value = Expr::app(
+            Expr::lam(
+                Name::anonymous(),
+                altered_body.base.type_.clone(),
+                Expr::bvar(0).unwrap(),
+                BinderInfo::Default,
+            ),
+            altered_body.value,
+        );
+        let Some(ConstantInfo::Ctor(mut altered_layout)) =
+            original.find(&name("Cache.add._impl")).cloned()
+        else {
+            panic!("generated constructor layout");
+        };
+        altered_layout.num_fields -= 1;
+        for replacement in [
+            ConstantInfo::Defn(altered_body),
+            ConstantInfo::Ctor(altered_layout),
+        ] {
+            let mut altered = Environment::new();
+            for (label, _) in original.constants() {
+                if label != replacement.name() {
+                    altered = altered.with_entry(original.entry(label).unwrap()).unwrap();
+                }
+            }
+            for (journal, state) in original.extensions() {
+                altered = altered
+                    .register_extension(state.descriptor.clone())
+                    .unwrap();
+                for entry in state.entries() {
+                    altered = altered
+                        .push_extension_entry(journal, entry.payload.clone())
+                        .unwrap();
+                }
+            }
+            altered = altered.add_decl(replacement).unwrap();
+            let error = fln_elab::computed_fields::validated_family(
+                &altered,
+                &name("Cache"),
+                limits().kernel,
+                Default::default(),
+            )
+            .expect_err("a journal claim cannot authorize a changed generated implementation");
+            assert!(
+                !error.is_resource_limit(),
+                "the complete mutated model must be rejected: {error:?}"
+            );
+        }
+    });
+}
+
+#[test]
+fn module_export_refuses_until_cached_layout_metadata_is_complete() {
+    with_fixture(|fixture| {
+        let module = name("Computed");
+        let source =
+            format!("module\nprelude\npublic import Init.Prelude\npublic section\n{SINGLE}");
+        let files = [SourceModuleInput {
+            name: &module,
+            source: source.as_bytes(),
+        }];
+        let options = KVMap::new();
+        let before = fixture.imported.engine.logical_root(&options);
+        let error = fixture
+            .imported
+            .compile_source_modules(
+                &files,
+                &module,
+                &options,
+                SourceModuleCheckLimits::new(check_limits()),
+                OleanWriteBudget::default(),
+            )
+            .expect_err("computed-field module artifacts require complete implementation metadata");
+        assert!(
+            matches!(error,
+                SourceModuleBuildError::Check(SourceModuleCheckError::Extension { module: ref failed, ref extension, reason })
+                    if failed == &module
+                    && extension == &fln_elab::computed_fields::journal_name()
+                    && reason == "computed-field artifacts require generated implementation compiler layouts and attribute metadata"
+            ),
+            "unexpected computed-field artifact refusal: {error:?}"
+        );
+        assert_eq!(fixture.imported.engine.logical_root(&options), before);
+    });
+}

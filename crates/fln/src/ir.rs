@@ -3100,6 +3100,7 @@ fn checked_recursive_companion(
         DefinitionCompileError::Engine(crate::EngineExecutionError::Ingress(error))
     })?;
     let (companion, work) = crate::runtime::Preparation::new(&runtime.environment, ingress)
+        .with_kernel_budget(engine_limits.kernel)
         .with_executable_opaques(&runtime.executable_opaques)
         .with_runtime_initializers(&runtime.runtime_initializers)
         .source_recursive_companion(logical)
@@ -3386,6 +3387,7 @@ pub(crate) fn compile_checked_source_definition(
         .max_nodes
         .min(usize::try_from(meter.0).unwrap_or(usize::MAX));
     let (erasures, work) = crate::runtime::Preparation::new(engine.environment(), ingress)
+        .with_kernel_budget(engine_limits.kernel)
         .source_parameter_erasures(&normalized_type)
         .map_err(|error| {
             DefinitionCompileError::Engine(crate::EngineExecutionError::Ingress(error))
@@ -3471,6 +3473,7 @@ fn compile_definition_impl(
                 .max_nodes
                 .min(usize::try_from(meter.0).unwrap_or(usize::MAX));
             let (erasures, work) = crate::runtime::Preparation::new(engine.environment(), ingress)
+                .with_kernel_budget(engine_limits.kernel)
                 .source_parameter_erasures(&normalized_type)
                 .map_err(|error| {
                     DefinitionCompileError::Engine(crate::EngineExecutionError::Ingress(error))

@@ -7466,6 +7466,7 @@ impl Engine {
         }
         let runtime_root = executable_environment.logical_root(options);
         let mut preparation = runtime::Preparation::new(executable_environment, limits.ingress)
+            .with_kernel_budget(limits.kernel)
             .with_executable_opaques(&runtime.executable_opaques)
             .with_runtime_initializers(&runtime.runtime_initializers);
         let evaluated = match entry {

@@ -29,8 +29,21 @@ pub(super) struct ShapeConstructor {
     pub name: Name,
     pub tag: u8,
     pub fields: Vec<Expr>,
+    /// Generated computed fields precede the logical fields in the object.
+    /// Recursor rules and minor telescopes still count only `fields`.
+    pub cached_fields: Vec<Expr>,
     /// Which fields hold a type (or type former) and are erased at runtime.
     pub type_fields: Vec<bool>,
+}
+
+impl ShapeConstructor {
+    pub(super) fn physical_field(&self, logical: usize) -> u64 {
+        (self.cached_fields.len() + logical) as u64
+    }
+
+    fn physical_fields(&self) -> impl DoubleEndedIterator<Item = &Expr> {
+        self.cached_fields.iter().chain(&self.fields)
+    }
 }
 
 /// The layout-only field type of a boxed polymorphic slot. It names no
@@ -64,13 +77,17 @@ impl Preparation<'_> {
         {
             return Ok(None);
         }
-        if let Some(shape) = self.data_shapes.get(&source) {
-            return Ok(Some(shape.clone()));
-        }
         let (head, parameters) = self.spine(&source)?;
         let ExprNode::Const { name, levels } = head.node() else {
             return Ok(None);
         };
+        // Recheck authority before a shape-cache hit as well. In particular,
+        // adding a runtime initializer to an existing Preparation invalidates
+        // the positive computed-family cache without changing source types.
+        let computed = self.computed_family_for_type(name)?;
+        if let Some(shape) = self.data_shapes.get(&source) {
+            return Ok(Some(shape.clone()));
+        }
         // Only exact primitive adapters create native cells. A same-named or
         // differently instantiated source Ref never receives an object-field
         // layout that could be confused with the VM's reference handle.
@@ -84,6 +101,10 @@ impl Preparation<'_> {
         let Some(ConstantInfo::Induct(family)) = self.environment.find(name) else {
             return Ok(None);
         };
+        // Provenance is a claim until the complete generated inventory and
+        // replacement edges have been regenerated and checked. In particular,
+        // never silently give a malformed computed family its logical layout.
+        let computed = computed.as_ref().filter(|model| model.family == *name);
         // Nested fields are ordinary admitted container applications. The
         // shared discovery worklist validates their entire representation
         // graph before any provisional data anchor becomes executable.
@@ -224,7 +245,33 @@ impl Preparation<'_> {
             {
                 return Ok(None);
             }
-            let constructor_name = if specialized {
+            let mut cached_fields = Vec::new();
+            if let Some(model) = computed {
+                let generated = model
+                    .constructors
+                    .get(index)
+                    .filter(|generated| {
+                        generated.logical == ctor.base.name
+                            && generated.num_fields as usize == fields.len()
+                    })
+                    .ok_or_else(|| {
+                        unsupported("computed constructor layout differs from its provenance")
+                    })?;
+                if generated.cached {
+                    for field in &model.fields {
+                        self.tick()?;
+                        reserve(&mut cached_fields, self.limits.max_context_depth)?;
+                        cached_fields.push(self.erase_runtime_type(&field.result_type)?);
+                    }
+                }
+            }
+            let constructor_name = if computed.is_some() {
+                // Original recursors project the augmented physical layout,
+                // while their public constructor applications select generated
+                // overrides. Keep this layout key distinct from both source
+                // constructors and the separately admitted `_impl` family.
+                Name::str(ctor.base.name.clone(), "_fln_runtime_computed")
+            } else if specialized {
                 Name::num(layout_name.clone(), index as u64)
             } else if type_fields.iter().any(|field| *field) {
                 // An erased Type slot may later be a let-bound inert value.
@@ -243,6 +290,7 @@ impl Preparation<'_> {
                 name: constructor_name,
                 tag,
                 fields,
+                cached_fields,
                 type_fields,
             });
         }
@@ -470,7 +518,7 @@ impl Preparation<'_> {
                     for field in shapes
                         .iter()
                         .flat_map(|shape| &shape.constructors)
-                        .flat_map(|ctor| &ctor.fields)
+                        .flat_map(ShapeConstructor::physical_fields)
                     {
                         self.tick()?;
                         // A familiar scalar name is not a representation.
@@ -518,7 +566,7 @@ impl Preparation<'_> {
                     for shape in &shapes {
                         for ctor in &shape.constructors {
                             let mut fields = Vec::new();
-                            for field in &ctor.fields {
+                            for field in ctor.physical_fields() {
                                 self.tick()?;
                                 let value = if shapes.iter().any(|member| field == &member.source) {
                                     ValueType::Constructor
@@ -547,7 +595,7 @@ impl Preparation<'_> {
                             // passed as a function. Its parameters have already been
                             // erased; every remaining domain is an actual field.
                             let mut type_ = shape.source.clone();
-                            for field in ctor.fields.iter().rev() {
+                            for field in ctor.physical_fields().rev() {
                                 self.tick()?;
                                 type_ = Expr::forall_e(
                                     Name::anonymous(),
@@ -710,6 +758,17 @@ impl Preparation<'_> {
         let Some(ConstantInfo::Ctor(ctor)) = self.environment.find(name) else {
             return Ok(None);
         };
+        if self
+            .computed_family_for_type(&ctor.induct)?
+            .is_some_and(|model| model.family == ctor.induct)
+        {
+            // The generated override computes every cache exactly once.
+            // Specialization must never turn a logical argument list into a
+            // physical constructor whose cache prefix has not been supplied.
+            return Err(unsupported(
+                "computed constructor bypassed its generated replacement",
+            ));
+        }
         let parameters = ctor.num_params as usize;
         // Nonparametric constructors need visiting only when fields are
         // supplied. A constructor with Type fields gets a final private name.
@@ -893,7 +952,11 @@ impl Preparation<'_> {
             .map_err(|_| unsupported("record minor scope"))?;
         for index in 0..ctor.fields.len() {
             self.tick()?;
-            let field = Expr::proj(shape.name.clone(), index as u64, major.clone());
+            let field = Expr::proj(
+                shape.name.clone(),
+                ctor.physical_field(index),
+                major.clone(),
+            );
             body = self.constructor_minor_apply(body, ctor, index, field)?;
         }
         let body = self.typed_callable_result(body, motive, result)?;

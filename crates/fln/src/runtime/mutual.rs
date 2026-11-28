@@ -224,7 +224,11 @@ impl Preparation<'_> {
                     body,
                     ctor,
                     field,
-                    Expr::proj(shape.projection(ctor), field as u64, major.clone()),
+                    Expr::proj(
+                        shape.projection(ctor),
+                        ctor.physical_field(field),
+                        major.clone(),
+                    ),
                 )?;
                 if self.recursive_field(type_, &group.families)?.is_some() {
                     reserve(&mut hypotheses, self.limits.max_context_depth)?;

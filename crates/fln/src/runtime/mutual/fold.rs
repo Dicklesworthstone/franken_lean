@@ -187,8 +187,11 @@ impl Preparation<'_> {
                 let mut logical_fields = self.indexed_constructor_telescope(shape, ctor, &[])?;
                 for (field_index, field_type) in ctor.fields.iter().enumerate() {
                     self.tick()?;
-                    let field =
-                        Expr::proj(shape.projection(ctor), field_index as u64, variable(0)?);
+                    let field = Expr::proj(
+                        shape.projection(ctor),
+                        ctor.physical_field(field_index),
+                        variable(0)?,
+                    );
                     body = self.constructor_minor_apply(body, ctor, field_index, field.clone())?;
                     let logical = self.type_head(&logical_fields)?;
                     let ExprNode::ForallE {

@@ -294,6 +294,20 @@ impl Preparation<'_> {
         let expected = self
             .record_shape(&pair.1)?
             .ok_or_else(|| unsupported("hidden target layout"))?;
+        if actual
+            .constructors
+            .iter()
+            .chain(&expected.constructors)
+            .any(|constructor| !constructor.cached_fields.is_empty())
+        {
+            // Computed families are closed and monomorphic in this profile.
+            // A future erased-container extension must preserve or recompute
+            // their caches instead of rebuilding a physical alias from only
+            // the logical minor arguments.
+            return Err(unsupported(
+                "computed-field representation cannot be rebuilt by an erased-container adapter",
+            ));
+        }
         let (head, parameters) = self.spine(&actual.source)?;
         let ExprNode::Const { name, levels } = head.node() else {
             return Err(unsupported("hidden container family"));
