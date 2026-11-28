@@ -1227,6 +1227,7 @@ impl Context {
                 }
             }
             let witness = self.fresh_name()?;
+            self.register_local_function_row(&witness)?;
             required.push(witness.clone());
             rows.push(Row {
                 patterns,

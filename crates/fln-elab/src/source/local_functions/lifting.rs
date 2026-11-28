@@ -2,13 +2,26 @@
 //! The inlined owner remains the same checked term; these independently checked
 //! closures expose the pin's owner.helper source interface after admission.
 use super::*;
+use fln_syntax::source::{ByteSpan, SourceInfo};
+use std::collections::HashMap;
 
-const MAX_LIFTED_FUNCTIONS: usize = 256;
+pub(in crate::source) const MAX_LIFTED_FUNCTIONS: usize = 256;
+
+/// A compiler-issued matrix row and a real source identifier within it. Neither
+/// matching names nor synthetic/default positions identify one declaration.
+#[derive(Clone, PartialEq, Eq)]
+struct Origin {
+    row: Name,
+    identifier: ByteSpan,
+}
 
 #[derive(Clone, Default)]
 pub(in crate::source) struct Lifting {
     pub parent: Option<Name>,
     names: HashSet<Name>,
+    origins: HashMap<Name, Origin>,
+    matrix_rows: HashSet<Name>,
+    pub active_matrix_row: Option<Name>,
     pub(super) closed: Vec<Closed>,
 }
 
@@ -28,9 +41,28 @@ impl Lifting {
 }
 
 impl Context {
+    pub(in crate::source) fn register_local_function_row(
+        &mut self,
+        row: &Name,
+    ) -> Result<(), NatDefinitionElabError> {
+        self.tick()?;
+        self.local_function_lifting.matrix_rows.insert(row.clone());
+        Ok(())
+    }
+
+    pub(in crate::source) fn enter_local_function_row(&mut self, row: &Name) -> Option<Name> {
+        let row = self
+            .local_function_lifting
+            .matrix_rows
+            .contains(row)
+            .then(|| row.clone());
+        std::mem::replace(&mut self.local_function_lifting.active_matrix_row, row)
+    }
+
     pub(super) fn reserve_local_function_name(
         &mut self,
         short: &Name,
+        identifier: &Syntax,
     ) -> Result<Option<Name>, NatDefinitionElabError> {
         self.tick()?;
         // An enclosing structural/well-founded lowering may elaborate the
@@ -47,18 +79,48 @@ impl Context {
         let Some(parent) = &self.local_function_lifting.parent else {
             return Ok(None);
         };
-        if self.local_function_lifting.names.len() >= MAX_LIFTED_FUNCTIONS {
-            return Err(failure(SourceInferenceError::ResourceLimit));
-        }
         let mut name = parent.append_core(short);
         if self.collect_partial_locals() && self.auxiliary_declarations_are_private() {
             let user = self.auxiliary_user_name(&name)?;
             name = self.source_scope.private_name(&user);
         }
-        if self.txn.env.contains(&name) || !self.local_function_lifting.names.insert(name.clone()) {
+        let origin = if self.collect_partial_locals()
+            && let Some(row) = self.local_function_lifting.active_matrix_row.clone()
+            && let Syntax::Ident {
+                info: SourceInfo::Original { pos, end_pos, .. },
+                ..
+            } = identifier
+            && pos < end_pos
+        {
+            Some(Origin {
+                row,
+                identifier: ByteSpan::new(*pos, *end_pos)
+                    .ok_or_else(|| failure(SourceInferenceError::Scope))?,
+            })
+        } else {
+            None
+        };
+        let repeated = self.local_function_lifting.names.contains(&name);
+        if self.txn.env.contains(&name)
+            || repeated
+                && !origin.as_ref().is_some_and(|origin| {
+                    self.local_function_lifting.origins.get(&name) == Some(origin)
+                })
+        {
             return Err(NatDefinitionElabError::UnexpectedSyntax {
                 expected: "a fresh local recursive declaration name",
             });
+        }
+        if !repeated {
+            if self.local_function_lifting.names.len() >= MAX_LIFTED_FUNCTIONS {
+                return Err(failure(SourceInferenceError::ResourceLimit));
+            }
+            self.local_function_lifting.names.insert(name.clone());
+            if let Some(origin) = origin {
+                self.local_function_lifting
+                    .origins
+                    .insert(name.clone(), origin);
+            }
         }
         Ok(Some(name))
     }

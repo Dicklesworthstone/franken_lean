@@ -2676,6 +2676,7 @@ impl Context {
             /// The finished chain, instantiated after its deferred step proofs.
             CalcDeferredFinish(Typed),
             MatrixScope(Vec<Name>),
+            RestoreLocalFunctionRow(Option<Name>),
             CaptureRecursiveContext,
             MatchMotive(matching::MatchParts<'a>, Option<Expr>),
             MatchDiscriminant(matching::MatchParts<'a>, Option<Expr>, Option<Expr>),
@@ -3143,6 +3144,9 @@ impl Context {
                                     }
                                 }
                             }
+                            Task::RestoreLocalFunctionRow(row) => {
+                                self.local_function_lifting.active_matrix_row = row;
+                            }
                             Task::Observe(syntax, locals) => {
                                 let term = values.last().expect("observed term visit");
                                 self.observe_term(syntax, term.clone(), locals)?;
@@ -3574,6 +3578,8 @@ impl Context {
                                             return Err(failure(SourceInferenceError::Scope));
                                         };
                                         self.matrix_rows.insert(val.clone());
+                                        let previous = self.enter_local_function_row(val);
+                                        tasks.push(Task::RestoreLocalFunctionRow(previous));
                                         tasks.push(Task::Visit(body, expected, finish));
                                         continue;
                                     }
@@ -6644,6 +6650,7 @@ impl Context {
         }
         Ok(local_functions::Binding {
             name,
+            identifier: &id[0],
             opaque,
             recursive,
             parameters: &declaration[1],

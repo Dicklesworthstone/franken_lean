@@ -6,6 +6,7 @@
 //! No candidate constant enters an environment during this conversion.
 use super::*;
 use std::collections::{HashMap, HashSet};
+mod copies;
 
 #[derive(Clone, Default)]
 pub(in crate::source) struct Locals {
@@ -167,13 +168,11 @@ impl Context {
             .partial
             .as_mut()
             .ok_or_else(|| failure(SourceInferenceError::Scope))?;
-        if state
-            .locals
-            .headers
-            .iter()
-            .any(|(existing, _)| existing == name)
-        {
-            return Err(refusal("fresh local partial names and companions"));
+        // Name reservation has already distinguished one matrix row's
+        // repeated source binding from a real duplicate declaration. Keep
+        // every copy as an independent obligation until closed comparison.
+        if state.locals.headers.len() >= local_functions::lifting::MAX_LIFTED_FUNCTIONS {
+            return Err(failure(SourceInferenceError::ResourceLimit));
         }
         state.locals.headers.push((name.clone(), marker.clone()));
         Ok(())
@@ -296,6 +295,9 @@ impl Context {
                         continue;
                     }
                     let mut declaration = declaration.clone();
+                    if let Some(name) = local.capture_names.get(&declaration.id) {
+                        declaration.user_name = name.clone();
+                    }
                     declaration.type_ = substitution.expression(self, &declaration.type_)?;
                     let dependencies = self.elimination_reads(&declaration.type_)?;
                     if dependencies.iter().any(|id| excluded.contains(id)) {
@@ -544,7 +546,7 @@ fn same_captures(left: &[LocalDecl], right: &[LocalDecl]) -> bool {
 }
 
 pub(super) fn finish(
-    context: Context,
+    mut context: Context,
     candidate: Declaration,
     environment: &Environment,
     kernel: Budget,
@@ -566,12 +568,39 @@ pub(super) fn finish(
     let [owner_body] = owner_body.as_slice() else {
         return Err(failure(SourceInferenceError::Scope));
     };
-    let mut names: Vec<_> = state
+    let local_names: Vec<_> = state
         .locals
         .closures
         .iter()
         .map(|closed| closed.name.clone())
         .collect();
+    let local_bodies = state.locals.definitions.clone();
+    let local_failed = state.locals.failed_codegen.clone();
+    if local_names.len() != local_bodies.len() || local_names.len() != local_failed.len() {
+        return Err(failure(SourceInferenceError::Scope));
+    }
+    let mut names = Vec::new();
+    let mut bodies: Vec<DefinitionVal> = Vec::new();
+    let mut failed = Vec::new();
+    for ((name, body), failure) in local_names.into_iter().zip(local_bodies).zip(local_failed) {
+        context.tick()?;
+        if let Some(index) = names.iter().position(|existing| existing == &name) {
+            let previous = &bodies[index];
+            if previous.base.level_params != body.base.level_params
+                || !copies::equivalent(&mut context, &previous.base.type_, &body.base.type_)?
+                || !copies::equivalent(&mut context, &previous.value, &body.value)?
+            {
+                return Err(refusal(
+                    "identical closed partial helpers for repeated matrix source bindings",
+                ));
+            }
+            failed[index] |= failure;
+        } else {
+            names.push(name);
+            bodies.push(body);
+            failed.push(failure);
+        }
+    }
     names.push(owner.clone());
     let mut reserved = HashSet::new();
     for name in &names {
@@ -581,9 +610,7 @@ pub(super) fn finish(
             }
         }
     }
-    let mut bodies = state.locals.definitions.clone();
     bodies.push(owner_body.clone());
-    let mut failed = state.locals.failed_codegen.clone();
     failed.push(context.noncomputable_definition);
     let scopes = vec![scope.clone(); names.len()];
     let mut result = group::finish_components(

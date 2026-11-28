@@ -19,11 +19,13 @@ pub(super) struct Deferred {
     pub lift_name: Option<Name>,
     pub lift_context: LocalContext,
     pub partial_marker: Option<FVarId>,
+    pub capture_names: std::collections::HashMap<FVarId, Name>,
 }
 
 #[derive(Clone)]
 pub(super) struct Binding<'a> {
     pub name: Name,
+    pub identifier: &'a Syntax,
     pub opaque: bool,
     pub recursive: bool,
     pub parameters: &'a Syntax,
@@ -264,6 +266,30 @@ impl Context {
         partial_marker: Option<FVarId>,
     ) -> Result<Typed, NatDefinitionElabError> {
         let locals = self.txn.lctx.decls().to_vec();
+        let mut capture_names = std::collections::HashMap::new();
+        if partial_marker.is_some() {
+            // Matrix aliases resolve to the physical field's identity. Keep
+            // its source label before leaving this branch, so a generated
+            // numeric column name cannot become the helper's public binder.
+            // Existing source parameters keep their own names.
+            let generated = |name: &Name| {
+                name.is_anonymous()
+                    || matches!(name.erase_macro_scopes().leaf_view(), LeafView::Num(_))
+            };
+            for alias in &locals {
+                self.tick()?;
+                if generated(&alias.user_name) {
+                    continue;
+                }
+                if let Some(value) = self.matrix_aliases.get(&alias.id)
+                    && let ExprNode::FVar { id } = value.node()
+                    && let Some(field) = self.txn.lctx.find(id)
+                    && generated(&field.user_name)
+                {
+                    capture_names.insert(id.clone(), alias.user_name.clone());
+                }
+            }
+        }
         let mut reads = self.elimination_reads(&value.value)?;
         reads.extend(self.elimination_reads(&value.type_)?);
         let mut captures = Vec::new();
@@ -314,6 +340,7 @@ impl Context {
             lift_name,
             lift_context: self.txn.lctx.clone(),
             partial_marker,
+            capture_names,
         });
         Ok(Typed {
             value: reference,
@@ -396,7 +423,7 @@ impl Context {
         expected: Option<Expr>,
     ) -> Result<Build<'a>, NatDefinitionElabError> {
         let lift_name = if binding.recursive {
-            self.reserve_local_function_name(&binding.name)?
+            self.reserve_local_function_name(&binding.name, binding.identifier)?
         } else {
             None
         };
@@ -840,6 +867,7 @@ mod tests {
         let missing = Syntax::Missing;
         let binding = Binding {
             name: Name::from_components(["go"]),
+            identifier: &missing,
             opaque: false,
             recursive: true,
             parameters: &missing,
