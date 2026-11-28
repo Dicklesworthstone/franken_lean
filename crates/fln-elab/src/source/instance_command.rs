@@ -236,21 +236,7 @@ pub(super) fn parts(syntax: &Syntax) -> Result<Parts<'_>, NatDefinitionElabError
             expect_atom(&p[1], "priority", "priority keyword")?;
             expect_atom(&p[2], ":=", "priority assignment")?;
             expect_atom(&p[4], ")", "priority closer")?;
-            let num = expect_node(
-                &p[3],
-                &Name::from_components(["num"]),
-                1,
-                "priority numeral",
-            )?;
-            let Syntax::Atom { val, .. } = &num[0] else {
-                return Err(failure(SourceInferenceError::Scope));
-            };
-            // This bounded profile supports nonnegative decimal u32 priorities.
-            if val.is_empty() || !val.bytes().all(|b| b.is_ascii_digit()) {
-                return Err(failure(SourceInferenceError::Scope));
-            }
-            val.parse::<u32>()
-                .map_err(|_| failure(SourceInferenceError::Scope))?
+            scope::simp::priority_value(&p[3])?
         }
         _ => return Err(failure(SourceInferenceError::Scope)),
     };

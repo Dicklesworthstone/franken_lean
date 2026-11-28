@@ -463,3 +463,48 @@ fn a_copied_parent_is_a_non_subobject_parent_the_pin_reads() {
         false,
     );
 }
+
+#[test]
+fn module_public_proof_projections_export_as_axioms_with_private_theorems() {
+    let built = compiled(&[(
+        "Main",
+        "module\nprelude\npublic section\n\
+         inductive Token where | left | right\n\
+         inductive Same {α : Type} (a : α) : α -> Prop where | refl : Same a a\n\
+         structure Witness where\n  value : Token\n  valid : Same value value\n\
+         structure Evidence (P : Prop) : Prop where\n  proof : P\n",
+    )]);
+    let view = fln_olean::region::OleanView::parse(&built.artifacts[0].bytes).unwrap();
+    let exported = fln_olean::decl::DeclDecoder::new(&view, fln::OleanWalkBudget::default())
+        .decode_module_constants()
+        .unwrap();
+    for projection in ["Witness.valid", "Evidence.proof"] {
+        assert!(
+            matches!(
+                built
+                    .checked
+                    .checked
+                    .engine
+                    .environment()
+                    .find(&name(projection)),
+                Some(fln::ConstantInfo::Thm(_))
+            ),
+            "private world must retain checked theorem proof for {projection}"
+        );
+        let target = name(projection);
+        assert!(
+            matches!(
+                exported.iter().find(|info| info.name() == &target),
+                Some(fln::ConstantInfo::Axiom(axiom)) if !axiom.is_unsafe
+            ),
+            "public .olean interface must erase proof projection {projection} to a safe axiom"
+        );
+    }
+    aliases::reference_import(
+        &built,
+        "module\nprelude\npublic import Main\n\
+         public theorem useValid (w : Witness) : Same w.value w.value := w.valid\n\
+         public theorem useProof (P : Prop) (e : Evidence P) : P := e.proof\n",
+        true,
+    );
+}

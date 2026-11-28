@@ -77,11 +77,18 @@ impl Render {
         rendered
     }
 
-    /// `mkBaseNameAux`: the body first, then each top-level binder as `Of…`.
-    fn aux(&mut self, binders: &[Winnowed], body: &Winnowed) -> String {
+    /// `mkBaseNameAux`: peel all top-level foralls (both header binders and
+    /// arrows inside the elaborated type) before rendering the body first,
+    /// then each top-level binder as `Of…` (`Lean/Elab/DeclNameGen.lean:158-172`).
+    fn aux(&mut self, binders: &[Winnowed], mut body: &Winnowed) -> String {
+        let mut all_binders: Vec<&Winnowed> = binders.iter().collect();
+        while let Winnowed::Forall(ty, rest) = body {
+            all_binders.push(ty);
+            body = rest;
+        }
         let base = self.core(body, false);
         let mut foralls = Vec::new();
-        for binder in binders.iter().rev() {
+        for binder in all_binders.into_iter().rev() {
             let rendered = self.core(binder, true);
             if !rendered.is_empty() {
                 foralls.push(format!("Of{rendered}"));

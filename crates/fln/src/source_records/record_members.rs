@@ -170,38 +170,44 @@ impl Engine {
         let header_quotations: BTreeSet<_> = record.header_quotations.iter().cloned().collect();
         let candidate =
             public.admit_prepared_source_record(syntax, record, options, limits, public_scope)?;
-        if !has_private_members {
-            return Ok(
-                match public.finish_source_deriving(
-                    candidate,
-                    deriving.as_ref(),
-                    options,
-                    limits,
-                    public_scope,
-                )? {
-                    Outcome::Complete(public) => Outcome::Complete(PublicSourceAdmission {
-                        public,
-                        private_implementation: None,
-                        metadata_complete: false,
-                    }),
-                    Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
-                    Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
-                },
-            );
-        }
-        if deriving
-            .as_ref()
-            .is_some_and(|request| !request.handlers.is_empty())
+        if has_private_members
+            && deriving
+                .as_ref()
+                .is_some_and(|request| !request.handlers.is_empty())
         {
             return Err(EngineExecutionError::UnexpectedPublication {
                 detail: "private-member record derivation requires the paired module handler plan",
             });
         }
+        let candidate = if !has_private_members {
+            public.finish_source_deriving(
+                candidate,
+                deriving.as_ref(),
+                options,
+                limits,
+                public_scope,
+            )?
+        } else {
+            candidate
+        };
         let candidate = match candidate {
             Outcome::Complete(candidate) => candidate,
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
+        let has_public_theorems = candidate.admissions.iter().any(|admitted| {
+            matches!(
+                &admitted.declaration,
+                Declaration::Thm(theorem) if !SourceScope::is_private_name(&theorem.base.name)
+            )
+        });
+        if !has_private_members && !has_public_theorems {
+            return Ok(Outcome::Complete(PublicSourceAdmission {
+                public: candidate,
+                private_implementation: None,
+                metadata_complete: false,
+            }));
+        }
         let mut quotation_budget = fln_elab::records::RecordBudget::default().max_nodes;
         for name in &header_quotations {
             quotation_budget = quotation_budget
@@ -271,6 +277,15 @@ impl Engine {
                 }
                 Declaration::Axiom(AxiomVal {
                     base: definition.base.clone(),
+                    is_unsafe: false,
+                })
+            } else if let Declaration::Thm(theorem) = declaration {
+                // Module interfaces export public theorems (including proof
+                // structure projections such as `And.left`, `Fin.isLt`,
+                // `Subtype.property`) as axioms in `.olean` while keeping
+                // their checked proof terms in `.olean.private`.
+                Declaration::Axiom(AxiomVal {
+                    base: theorem.base.clone(),
                     is_unsafe: false,
                 })
             } else {

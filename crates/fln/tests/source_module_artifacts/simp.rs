@@ -1520,3 +1520,40 @@ fn simp_metadata_obeys_the_module_writer_budget() {
     assert_eq!(error.disposition(), ("resource", false, 3));
     assert!(initial.environment().is_empty());
 }
+
+#[test]
+fn method_specs_simp_attribute_validates_targets_without_entering_default_simp() {
+    let initial = Engine::builder().build_empty();
+    let built = compiled(&[(
+        "Main",
+        "module\nprelude\npublic section\n\
+         inductive N : Type where | z : N | s : N -> N\n\
+         inductive Same {α : Type} (a : α) : α -> Prop where | refl : Same a a\n\
+         def idN (n : N) : N := n\n\
+         @[method_specs_simp] theorem idN_eq (n : N) : Same (idN n) n := Same.refl\n\
+         @[method_specs_simp ← low + 1] theorem idN_eq_rev (n : N) : Same n (idN n) := Same.refl\n\
+         @[local method_specs_simp ↓] theorem idN_eq_pre (n : N) : Same (idN n) n := Same.refl\n",
+    )]);
+    assert!(
+        built
+            .checked
+            .checked
+            .engine
+            .environment()
+            .contains(&name("idN_eq"))
+    );
+    let active = simp::read(built.checked.checked.engine.environment()).unwrap();
+    assert!(
+        active.is_empty(),
+        "method_specs_simp must stay out of the default simp set: {active:?}"
+    );
+    for bad in [
+        "prelude\n@[method_specs_simp] inductive Bad where | a\n",
+        "prelude\n@[method_specs_simp] structure Bad where\n  x : Prop\n",
+        "prelude\ninductive N where | z\n@[method_specs_simp] opaque badOpaque (n : N) : N := n\n",
+    ] {
+        let err = build(&initial, &[("Main", bad)], OleanWriteBudget::default()).unwrap_err();
+        assert_eq!(err.disposition().2, 1, "must refuse invalid target: {bad}");
+    }
+    assert!(initial.environment().is_empty());
+}

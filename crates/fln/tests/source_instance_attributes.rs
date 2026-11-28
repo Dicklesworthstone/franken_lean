@@ -647,3 +647,61 @@ fn proof_projections_are_checked_as_theorems_and_cannot_receive_reducibility_att
     }
     assert!(!base.environment().contains(&n("Witness")));
 }
+
+#[test]
+fn named_and_arithmetic_instance_priorities_and_post_colon_instance_names() {
+    let source = r#"
+class Tag (α : Type) where
+  code : Nat
+
+instance (priority := low) instLow : Tag Nat where
+  code := 100
+
+instance (priority := low + 1) instLowPlusOne : Tag Nat where
+  code := 101
+
+instance (priority := default - 1) instBelowDefault : Tag Nat where
+  code := 999
+
+instance (priority := 0 - 1) instSaturatedZero : Tag Nat where
+  code := 0
+
+theorem pickedHighest : Tag.code (α := Nat) = 999 := by rfl
+
+class MonadLike (m : Type -> Type) where
+  wrap {α : Type} : α -> m α
+
+class inductive NonemptyLike (α : Type) : Prop where
+  | intro (val : α) : NonemptyLike α
+
+instance {α : Type} {m : Type -> Type} [MonadLike m] : [NonemptyLike α] -> NonemptyLike (m α)
+  | NonemptyLike.intro x => NonemptyLike.intro (MonadLike.wrap x)
+"#;
+    let base = engine();
+    let result = checked(&base, source);
+    let registry = InstanceRegistry::read(result.environment()).unwrap();
+    let priority = |name| {
+        registry
+            .candidates(&n("Tag"))
+            .iter()
+            .find(|entry| entry.declaration == n(name))
+            .unwrap()
+            .priority
+    };
+    assert_eq!(priority("instLow"), 100);
+    assert_eq!(priority("instLowPlusOne"), 101);
+    assert_eq!(priority("instBelowDefault"), 999);
+    assert_eq!(priority("instSaturatedZero"), 0);
+    assert!(
+        result
+            .environment()
+            .contains(&n("instNonemptyLikeOfMonadLike")),
+        "post-colon arrow binder must peel before naming the target class"
+    );
+    assert!(
+        !result
+            .environment()
+            .contains(&n("instForallNonemptyLikeOfMonadLike")),
+        "post-colon arrow binder must not prepend Forall"
+    );
+}

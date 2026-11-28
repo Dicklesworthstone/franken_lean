@@ -23,13 +23,23 @@ pub use imports::{
 };
 
 /// A `prio` tree's value: a decimal numeral, `default`/`low`/`mid`/`high` (1000, 100, 500 and
-/// 10000, vendored `src/Init/Notation.lean`), or either in parentheses. Priority arithmetic and
-/// other radixes are refused.
+/// 10000, vendored `src/Init/Notation.lean`), parenthesized priorities, or `+`/`-` priority
+/// arithmetic (`Syntax.addPrio`/`Syntax.subPrio`, vendored `src/Init/Meta.lean:25-29`).
 pub(in crate::source) fn priority_value(
     priority: &fln_syntax::tree::Syntax,
 ) -> Result<u32, crate::NatDefinitionElabError> {
+    priority_value_bounded(priority, 64)
+}
+
+fn priority_value_bounded(
+    priority: &fln_syntax::tree::Syntax,
+    remaining_depth: usize,
+) -> Result<u32, crate::NatDefinitionElabError> {
     use super::super::*;
     let refuse = |expected| NatDefinitionElabError::UnexpectedSyntax { expected };
+    let Some(next_depth) = remaining_depth.checked_sub(1) else {
+        return Err(failure(SourceInferenceError::ResourceLimit));
+    };
     let Syntax::Node { kind, args, .. } = priority else {
         return Err(refuse("numeric priority"));
     };
@@ -49,7 +59,27 @@ pub(in crate::source) fn priority_value(
         let [_, inner, _] = args.as_slice() else {
             return Err(refuse("parenthesized priority"));
         };
-        return priority_value(inner);
+        return priority_value_bounded(inner, next_depth);
+    }
+    if kind == &parser_kind(&["Syntax", "addPrio"]) {
+        let [left, op, right] = args.as_slice() else {
+            return Err(refuse("priority addition"));
+        };
+        expect_atom(op, "+", "priority addition operator")?;
+        let left = priority_value_bounded(left, next_depth)?;
+        let right = priority_value_bounded(right, next_depth)?;
+        return left
+            .checked_add(right)
+            .ok_or_else(|| refuse("u32 priority"));
+    }
+    if kind == &parser_kind(&["Syntax", "subPrio"]) {
+        let [left, op, right] = args.as_slice() else {
+            return Err(refuse("priority subtraction"));
+        };
+        expect_atom(op, "-", "priority subtraction operator")?;
+        let left = priority_value_bounded(left, next_depth)?;
+        let right = priority_value_bounded(right, next_depth)?;
+        return Ok(left.saturating_sub(right));
     }
     let numeral = expect_node(
         priority,
@@ -64,6 +94,109 @@ pub(in crate::source) fn priority_value(
         return Err(refuse("decimal priority"));
     }
     val.parse::<u32>().map_err(|_| refuse("u32 priority"))
+}
+
+/// Validate a named `@[method_specs_simp]` attribute (`Init/Tactics.lean:2481`,
+/// `Lean/Meta/MethodSpecs.lean:123`). Entries belong to the separate `method_specs_simp`
+/// simp set and must never enter the default `simp` set.
+fn method_specs_simp_attribute(
+    attribute: &fln_syntax::tree::Syntax,
+) -> Result<bool, crate::NatDefinitionElabError> {
+    use super::super::*;
+    let instance = expect_node(
+        attribute,
+        &parser_kind(&["Term", "attrInstance"]),
+        2,
+        "attribute instance",
+    )?;
+    if instance[1].kind() != Some(&parser_kind(&["Attr", "method_specs_simp"])) {
+        return Ok(false);
+    }
+    let scope = expect_node(
+        &instance[0],
+        &parser_kind(&["Term", "attrKind"]),
+        1,
+        "attribute scope",
+    )?;
+    match expect_null_args(&scope[0], "method_specs_simp attribute scope")? {
+        [] => {}
+        [kind] if kind.kind() == Some(&parser_kind(&["Term", "local"])) => {
+            let parts = expect_node(kind, &parser_kind(&["Term", "local"]), 1, "local attribute")?;
+            expect_atom(&parts[0], "local", "local attribute keyword")?;
+        }
+        [kind] if kind.kind() == Some(&parser_kind(&["Term", "scoped"])) => {
+            let parts = expect_node(
+                kind,
+                &parser_kind(&["Term", "scoped"]),
+                1,
+                "scoped attribute",
+            )?;
+            expect_atom(&parts[0], "scoped", "scoped attribute keyword")?;
+        }
+        _ => {
+            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "global, local, or scoped method_specs_simp attribute",
+            });
+        }
+    }
+    let parts = expect_node(
+        &instance[1],
+        &parser_kind(&["Attr", "method_specs_simp"]),
+        4,
+        "method_specs_simp attribute",
+    )?;
+    expect_atom(
+        &parts[0],
+        "method_specs_simp",
+        "method_specs_simp attribute keyword",
+    )?;
+    match expect_null_args(&parts[1], "method_specs_simp phase")? {
+        [] => {}
+        [phase] if phase.kind() == Some(&parser_kind(&["Tactic", "simpPre"])) => {
+            let args = expect_node(
+                phase,
+                &parser_kind(&["Tactic", "simpPre"]),
+                1,
+                "method_specs_simp pre phase",
+            )?;
+            expect_atom(&args[0], "↓", "simp pre marker")?;
+        }
+        [phase] if phase.kind() == Some(&parser_kind(&["Tactic", "simpPost"])) => {
+            let args = expect_node(
+                phase,
+                &parser_kind(&["Tactic", "simpPost"]),
+                1,
+                "method_specs_simp post phase",
+            )?;
+            expect_atom(&args[0], "↑", "simp post marker")?;
+        }
+        _ => {
+            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "method_specs_simp phase",
+            });
+        }
+    }
+    match expect_null_args(&parts[2], "method_specs_simp direction")? {
+        [] => {}
+        [Syntax::Atom { val, .. }] if val == "←" || val == "<-" => {}
+        _ => {
+            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "method_specs_simp direction",
+            });
+        }
+    }
+    match expect_null_args(&parts[3], "method_specs_simp priority")? {
+        [] => {}
+        [priority] => {
+            priority_value(priority)?;
+        }
+        _ => {
+            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "numeric priority",
+            });
+        }
+    }
+    Ok(true)
 }
 
 /// A code generator hint: an inlining kind (the pin's `inlineAttrs`, Lean/Compiler/InlineAttrs.lean),
@@ -333,6 +466,7 @@ pub fn registration(
     instance_command::default_registration(syntax)?;
     instance_command::inline_registration(syntax)?;
     let mut simp = None;
+    let mut method_specs_simp = false;
     let mut inlining = false;
     let mut macro_inline = false;
     for attribute in super::visibility::attributes(&modifiers[1])? {
@@ -342,6 +476,10 @@ pub fn registration(
             || instance_command::default_attribute(attribute)?.is_some()
             || instance_command::attribute_priority(attribute)?.is_some()
         {
+            continue;
+        }
+        if method_specs_simp_attribute(attribute)? {
+            method_specs_simp = true;
             continue;
         }
         if let Some(hint) = compiler_hint(attribute)? {
@@ -367,6 +505,15 @@ pub fn registration(
                 expected: "one simp attribute beside exposure attributes",
             });
         }
+    }
+    if method_specs_simp
+        && !["definition", "abbrev", "theorem", "instance"]
+            .iter()
+            .any(|kind| declaration[1].kind() == Some(&parser_kind(&["Command", kind])))
+    {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "method_specs_simp definition, abbreviation, theorem or instance",
+        });
     }
     // The pin's `checkIsDefinition`: a definition (`def`, `abbrev`, `instance`) or an opaque
     // constant; a theorem or an axiom is refused, "Declaration `d` is not a definition".
