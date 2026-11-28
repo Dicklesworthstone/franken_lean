@@ -55,7 +55,7 @@ pub fn statuses(
     let prior = base.extension(&extension_name());
     let start = prior.map_or(0, |state| state.len());
     let mut remaining = max_work;
-    let mut entries = current.entries();
+    let mut entries = result.metadata_validation_entries(&current.descriptor.name);
     if let Some(prior) = prior {
         if prior.descriptor != current.descriptor || start > current.len() {
             return Err(ReducibilityError::Malformed);
@@ -65,7 +65,7 @@ pub fn statuses(
         }
         for old in prior.entries() {
             charge(&mut remaining, 1)?;
-            let new = entries.next().ok_or(ReducibilityError::Malformed)?;
+            let (new, _) = entries.next().ok_or(ReducibilityError::Malformed)?;
             // Untouched persistent entries share their payload allocation.
             // As in source-module replay, don't charge imported bytes again.
             if Arc::ptr_eq(&old.payload, &new.payload) {
@@ -81,15 +81,22 @@ pub fn statuses(
     let mut rows = BTreeMap::new();
     let mut imported = Vec::new();
     let mut defaults = BTreeSet::new();
-    for entry in entries {
+    for (entry, validation) in entries {
         charge(&mut remaining, 1)?;
         charge(&mut remaining, entry.payload.len())?;
         let (declaration, status) = read_entry(&entry.payload)?;
         if declaration.is_anonymous() {
             return Err(ReducibilityError::Malformed);
         }
-        if !result.contains(&declaration) {
+        if !validation.contains(&declaration) {
             return Err(ReducibilityError::UnknownDeclaration(declaration));
+        }
+        // A checked public module can retain metadata for its private
+        // projections/defaults. Validate the exact anchored row against its
+        // complete checked world, but only visible declaration owners receive
+        // public wire rows. An unanchored missing target still refuses above.
+        if !result.contains(&declaration) {
+            continue;
         }
         let Some(status) = status else {
             if !base.contains(&declaration) {
@@ -195,6 +202,56 @@ mod tests {
         );
         assert_eq!(statuses(&base, &base, 0).unwrap(), Statuses::default());
         assert_eq!(result.logical_root(&KVMap::new()), root);
+    }
+
+    #[test]
+    fn private_statuses_require_exact_checked_metadata_and_do_not_become_public_rows() {
+        let base = Environment::new();
+        let complete = with_axiom(&with_axiom(&base, "Hidden"), "Visible");
+        let complete = register(&complete, &n("Hidden"), Reducibility::Reducible).unwrap();
+        let complete = register(&complete, &n("Visible"), Reducibility::Irreducible).unwrap();
+        let mut public = with_axiom(&base, "Visible")
+            .register_extension(descriptor())
+            .unwrap();
+        for entry in complete.extension(&extension_name()).unwrap().entries() {
+            public = public
+                .push_extension_entry(&extension_name(), Arc::clone(&entry.payload))
+                .unwrap();
+        }
+        assert_eq!(
+            statuses(&base, &public, usize::MAX),
+            Err(ReducibilityError::UnknownDeclaration(n("Hidden")))
+        );
+        let public = public.with_imported_metadata_validation(&complete);
+        let exported = statuses(&base, &public, usize::MAX).unwrap();
+        assert_eq!(
+            exported.owned,
+            [Registration {
+                declaration: n("Visible"),
+                status: Reducibility::Irreducible,
+            }]
+        );
+        assert!(exported.imported.is_empty());
+        assert_eq!(statuses(&base, &public, exported.work).unwrap(), exported);
+        assert_eq!(
+            statuses(&base, &public, exported.work - 1),
+            Err(ReducibilityError::Limit)
+        );
+        // A copied row appended after the bound prefix has no authority from
+        // the earlier private declaration, even with identical payload bytes.
+        let hidden = complete
+            .extension(&extension_name())
+            .unwrap()
+            .entries()
+            .next()
+            .unwrap();
+        let changed = public
+            .push_extension_entry(&extension_name(), Arc::clone(&hidden.payload))
+            .unwrap();
+        assert_eq!(
+            statuses(&base, &changed, usize::MAX),
+            Err(ReducibilityError::UnknownDeclaration(n("Hidden")))
+        );
     }
 
     #[test]

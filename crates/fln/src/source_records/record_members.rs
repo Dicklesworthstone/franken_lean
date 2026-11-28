@@ -167,6 +167,7 @@ impl Engine {
         let has_private_members = !record.private_members.is_empty();
         let family = record.name.clone();
         let default_helpers = record.default_helpers.clone();
+        let header_quotations: BTreeSet<_> = record.header_quotations.iter().cloned().collect();
         let candidate =
             public.admit_prepared_source_record(syntax, record, options, limits, public_scope)?;
         if !has_private_members {
@@ -201,13 +202,43 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
+        let mut quotation_budget = fln_elab::records::RecordBudget::default().max_nodes;
+        for name in &header_quotations {
+            quotation_budget = quotation_budget
+                .checked_sub(1)
+                .ok_or_else(|| frontend(fln_elab::source::SourceInferenceError::ResourceLimit))?;
+            // The typed inventory determines which helpers are quotations;
+            // helper spelling or membership in default_helpers is insufficient.
+            // As for ordinary public headers, retain only closed safe Syntax
+            // data, then independently recheck its body in the public batch.
+            if !matches!(candidate.engine.environment().find(name),
+                Some(ConstantInfo::Defn(definition))
+                    if definition.safety == DefinitionSafety::Safe
+                        && definition.base.level_params.is_empty()
+                        && definition.base.type_ == Expr::const_(
+                            Name::from_components(["Lean", "Syntax"]), Vec::new())
+                        && !definition.value.has_fvar()
+                        && !definition.value.has_loose_bvars()
+                        && !definition.value.has_expr_mvar()
+                        && !definition.value.has_level_mvar()
+                        && !definition.value.has_level_param())
+            {
+                return Err(EngineExecutionError::UnexpectedPublication {
+                    detail: "a public record header quotation must be closed safe Lean.Syntax data",
+                });
+            }
+        }
         let private_ctor = matches!(candidate.engine.environment().find(&family),
             Some(ConstantInfo::Induct(inductive))
                 if inductive.ctors.iter().any(SourceScope::is_private_name));
         let hidden_wrappers: BTreeSet<_> = ["recOn", "casesOn", "noConfusionType", "noConfusion"]
             .into_iter()
             .map(|suffix| Name::str(family.clone(), suffix))
-            .chain(default_helpers)
+            .chain(
+                default_helpers
+                    .into_iter()
+                    .filter(|name| !header_quotations.contains(name)),
+            )
             .collect();
         let complete: Vec<_> = candidate
             .admissions
@@ -266,13 +297,26 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
+        // Earlier imported journal rows may name hidden imported projections.
+        // Binding a new complete prefix to the private logical map alone would
+        // discard those rows' complete validation context. Reuse the checked,
+        // identity-validated import overlay only as a metadata witness; logical
+        // lookup and both declaration admission worlds remain unchanged.
+        let mut ingress = IngressLimits::default();
+        ingress.max_nodes = ingress
+            .max_nodes
+            .min(usize::try_from(limits.kernel.steps).unwrap_or(usize::MAX));
+        let validation = private
+            .engine
+            .runtime_environment(ingress)
+            .map_err(EngineExecutionError::Ingress)?;
         projected.engine.environment = record_metadata(
             public.environment(),
             candidate.engine.environment(),
             projected.engine.environment,
             true,
         )?
-        .with_imported_metadata_validation(private.engine.environment());
+        .with_imported_metadata_validation(&validation.environment);
         projected.result_logical_root = projected.engine.logical_root(options);
         Ok(Outcome::Complete(PublicSourceAdmission {
             public: projected,

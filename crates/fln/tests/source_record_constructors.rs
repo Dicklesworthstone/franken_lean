@@ -130,7 +130,7 @@ attribute [pp_using_anonymous_constructor] Pair Pair
 @[pp_using_anonymous_constructor] structure Nested where
   pair : Pair
   last : Nat
-@[pp_using_anonymous_constructor] structure Empty where
+@[pp_using_anonymous_constructor] structure EmptyRecord where
 @[pp_using_anonymous_constructor] inductive Atom where | mk
 @[pp_using_anonymous_constructor] inductive Phantom (A : Type) where | mk
 @[pp_using_anonymous_constructor] inductive Recursive where | stop | next (tail : Recursive)
@@ -142,7 +142,7 @@ attribute [pp_using_anonymous_constructor] CtorOnly.mk
 attribute [pp_using_anonymous_constructor] identity
 def pair : Pair := Pair.mk 1 2
 def nested : Nested := Nested.mk (Pair.mk 1 2) 3
-def empty : Empty := Empty.mk
+def empty : EmptyRecord := EmptyRecord.mk
 def atom : Atom := Atom.mk
 def phantom : Phantom Nat := Phantom.mk
 def ctorOnly : CtorOnly := CtorOnly.mk 4
@@ -153,7 +153,7 @@ def ctorOnly : CtorOnly := CtorOnly.mk 4
     for tagged in [
         "Pair",
         "Nested",
-        "Empty",
+        "EmptyRecord",
         "Atom",
         "Phantom",
         "Recursive",

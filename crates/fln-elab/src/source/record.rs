@@ -23,6 +23,9 @@ pub struct SourceRecord {
     /// Every generated default helper, including flat helpers outside the physical registry.
     /// Admission preserves these as definitions with ordinary default transparency.
     pub default_helpers: Vec<Name>,
+    /// Exact checked syntax quotations used by header autoParams. Their bodies
+    /// remain data needed by elaboration, even when a constructor is private.
+    pub header_quotations: Vec<Name>,
     /// Parent metadata and instance registrations are published only after checking.
     pub parents: Vec<RecordParent>,
     pub parent_instances: Vec<Name>,
@@ -790,9 +793,11 @@ fn elaborate_record_in_world(
         };
         let saved = std::mem::replace(&mut context.txn.lctx, record_header);
         let generated = context.record_default_overrides(
-            &provisional,
+            flat::NamedRecord {
+                spec: &provisional,
+                names: &member_names,
+            },
             &constructor_name,
-            &member_names,
             &inheritance,
             &overrides,
             &mut auto_parameters,
@@ -933,9 +938,11 @@ fn elaborate_record_in_world(
         is_class,
     };
     context.record_flat_defaults(
-        &spec,
+        flat::NamedRecord {
+            spec: &spec,
+            names: &member_names,
+        },
         &constructor_name,
-        &member_names,
         &inheritance,
         &mut helpers,
         &mut defaults,
@@ -946,9 +953,11 @@ fn elaborate_record_in_world(
         declarations: flat_declarations,
         auto_parameters: resolved_auto_parameters,
     } = context.record_flat_constructor(
-        &spec,
+        flat::NamedRecord {
+            spec: &spec,
+            names: &member_names,
+        },
         &constructor_name,
-        &member_names,
         &inheritance,
         &declared_defaults,
         &auto_parameters,
@@ -1002,13 +1011,13 @@ fn elaborate_record_in_world(
     declarations.extend(helpers);
     // These names are data helpers, not field projections. Keep their opaque
     // hints and ordinary default transparency through the facade's classifier.
-    default_helpers.extend(
-        context
-            .auxiliary_visibility
-            .header_quotations
-            .iter()
-            .cloned(),
-    );
+    let header_quotations: Vec<_> = context
+        .auxiliary_visibility
+        .header_quotations
+        .iter()
+        .cloned()
+        .collect();
+    default_helpers.extend(header_quotations.iter().cloned());
     let mut predecessors = std::mem::take(&mut context.auxiliary_declarations);
     predecessors.append(&mut declarations);
     declarations = predecessors;
@@ -1068,6 +1077,7 @@ fn elaborate_record_in_world(
         declarations,
         defaults,
         default_helpers,
+        header_quotations,
         parents: inheritance.parents,
         parent_instances,
         flat_constructor,

@@ -22,6 +22,12 @@ struct DeclaredDefaults<'a> {
     tactics: &'a std::collections::BTreeMap<Name, Expr>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct NamedRecord<'a> {
+    pub(super) spec: &'a RecordSpec,
+    pub(super) names: &'a MemberNames,
+}
+
 fn problem(error: crate::records::RecordError) -> NatDefinitionElabError {
     failure(SourceInferenceError::Record(error))
 }
@@ -220,14 +226,14 @@ impl Context {
     /// elaborated, including uses that a tactic would erase from its result.
     pub(super) fn record_default_overrides(
         &mut self,
-        spec: &RecordSpec,
+        record: NamedRecord<'_>,
         constructor_name: &Name,
-        names: &MemberNames,
         inheritance: &Inheritance,
         overrides: &[DefaultOverride],
         auto_parameters: &mut std::collections::BTreeMap<Name, Expr>,
         budget: RecordBudget,
     ) -> Result<Vec<Declaration>, NatDefinitionElabError> {
+        let NamedRecord { spec, names } = record;
         let structures = ImportedStructures::read(&self.txn.env).map_err(problem)?;
         let mut pending: Vec<_> = inheritance
             .direct
@@ -571,14 +577,14 @@ impl Context {
     /// compiled module boundary. Keep legacy inherited registry rows intact.
     pub(super) fn record_flat_defaults(
         &mut self,
-        spec: &RecordSpec,
+        record: NamedRecord<'_>,
         constructor_name: &Name,
-        names: &MemberNames,
         inheritance: &Inheritance,
         helpers: &mut [Declaration],
         defaults: &mut Vec<RecordDefault>,
         budget: RecordBudget,
     ) -> Result<(), NatDefinitionElabError> {
+        let NamedRecord { spec, names } = record;
         if !defaults.iter().any(|row| {
             spec.fields
                 .get(row.field as usize)
@@ -654,14 +660,14 @@ impl Context {
 
     pub(super) fn record_flat_constructor(
         &mut self,
-        spec: &RecordSpec,
+        record: NamedRecord<'_>,
         constructor_name: &Name,
-        names: &MemberNames,
         inheritance: &Inheritance,
         declared_defaults: &[Name],
         auto_parameters: &std::collections::BTreeMap<Name, Expr>,
         budget: RecordBudget,
     ) -> Result<RecordFlatConstructor, NatDefinitionElabError> {
+        let NamedRecord { spec, .. } = record;
         let saved = self.txn.lctx.clone();
         let result = (|| {
             let (mut fields, value) =
@@ -684,8 +690,7 @@ impl Context {
                 mut declarations,
                 auto_parameters,
             } = self.record_flat_inherited_defaults(
-                spec,
-                names,
+                record,
                 inheritance,
                 DeclaredDefaults {
                     values: declared_defaults,
@@ -733,14 +738,14 @@ impl Context {
     /// from an intermediate parent are deliberately not fresh declarations.
     fn record_flat_inherited_defaults(
         &mut self,
-        spec: &RecordSpec,
-        names: &MemberNames,
+        record: NamedRecord<'_>,
         inheritance: &Inheritance,
         defaults: DeclaredDefaults<'_>,
         fields: &mut [LocalDecl],
         constructor: &Expr,
         closer: &mut crate::records::Builder,
     ) -> Result<RecordFlatConstructor, NatDefinitionElabError> {
+        let NamedRecord { spec, names } = record;
         let plain_fields = fields.to_vec();
         // Track generated defaults separately from authored type annotations.
         // A new tactic wraps a root field's complete authored domain; inherited

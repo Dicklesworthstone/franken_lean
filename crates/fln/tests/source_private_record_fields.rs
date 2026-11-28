@@ -154,7 +154,7 @@ fn assert_shape(env: &Environment, module: &str, modern: bool) {
     let Some(ConstantInfo::Induct(family)) = env.find(&name("Secret")) else {
         panic!("missing Secret family");
     };
-    assert_eq!(family.ctors, [constructor.clone()]);
+    assert_eq!(family.ctors, std::slice::from_ref(&constructor));
     assert!(matches!(
         env.find(&constructor),
         Some(ConstantInfo::Ctor(_))
